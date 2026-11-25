@@ -313,7 +313,17 @@ fn a_wave_or_inside(skip: u32, name: &str) {
         }
     };
     // (threads below s0 take the branch; thread t gives bit t >> 1)
-    for (below, expected) in [(64u32, u32::MAX), (40, 0x000F_FFFF), (33, 0x0001_FFFF), (10, 0x1F), (1, 1)] {
+    for (below, expected) in [
+        (64u32, u32::MAX),
+        (63, u32::MAX),
+        (40, 0x000F_FFFF),
+        (33, 0x0001_FFFF),
+        (32, 0x0000_FFFF),
+        (31, 0x0000_FFFF),
+        (10, 0x1F),
+        (1, 1),
+        (0, 0),
+    ] {
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {

@@ -176,6 +176,21 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   semantics; taking either side alone would silently miscompile. No change landed.
 
 ### Intro visual baseline and texture-budget caveat
+- Seven refused compute shaders were independently tested offline with a
+  32-lane host limit. All seven validate as DXIL but their default output
+  requests wave64, which the RTX 5080 cannot create. With experimental
+  wave-wide lowering, visibility (`369cbe906ea72764`), opaque tiling
+  (`2cc4c197ee29e291`), tiled transmission (`5dc3b25986622949`) and its
+  local-lights variant (`6f225b641c5b0708`) create pipelines offline; none
+  was dispatched or shown correct. Defragmentation (`02384a60fda6f2d0`),
+  alpha prefilter (`2da4beb386509b77`) and meshlet triangle collection
+  (`6b82bc7d22016cb5`) have multiple console waves per group and still
+  require wave64. On the hardware device two existing small wave-wide branch
+  fixtures passed their output checks, including both skip forms and the SCC
+  join case; a separate wave64 reduction fixture also matched its expected
+  console-tree result. The branch fixture additionally covers zero active
+  lanes and the 31/32/33-lane boundary on hardware. These fixtures do not
+  establish safety of the title shaders.
 - Full-translation caveat: the default wave64 retry allows explicitly
   approximate half-wave lowering (`emit/mod.rs`, `VICTORY_WAVE_LOCAL` unset).
   The `cachefix1` fresh-translation log contains 22 successful approximate
