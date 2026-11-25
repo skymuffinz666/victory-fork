@@ -2864,6 +2864,9 @@ mod tests {
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
         slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
+        // A whole-resource self-copy after the upload must preserve its pixels.
+        // D3D12 cannot record CopyResource with the same source and destination.
+        slot::<extern "system" fn(This, This, This)>(list, 0x88)(list, image, image);
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
