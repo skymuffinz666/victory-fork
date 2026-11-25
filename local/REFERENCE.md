@@ -176,6 +176,15 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   semantics; taking either side alone would silently miscompile. No change landed.
 
 ### Intro visual baseline and texture-budget caveat
+- `quadhelpers1` ran with `VICTORY_PIXEL_QUAD_HELPERS=1` and was stopped at
+  the user's request; `exited=True` in its runner output reflects that stop,
+  not a natural exit. It reached the prison corridor (`frame-3106.png`), with
+  seven compute pipeline refusals and ten shader translation failures; no
+  unhandled exception or device removal was logged. Final diagnostic intervals
+  were approximately 3.6–4.4 fps. The run used different scenes and player
+  progress from the baseline, so neither a visual improvement from quad reads
+  nor a frame-rate improvement has been established. The option remains off
+  by default. The later raw-SRV dedicated-copy experiment was not in the binary.
 - The `desccompare1` run was manually stopped in the prison scene. It used
   exact tag/index/generation comparison in the copied-descriptor sweep in
   place of a truncated BLAKE3 fingerprint, with no experimental pixel-quad

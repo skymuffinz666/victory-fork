@@ -2118,6 +2118,30 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if len == 0 {
         return None;
     }
+    // Match the dedicated copy made by `buffer_srv` for an experimentally
+    // enabled, unaligned raw SRV. Never apply this path to writable views.
+    let srv_words: Option<&[u32; 10]> = match view {
+        View::Shader(_, Some(desc)) => Some(desc),
+        View::Placed(false, resource, desc) if resource[0] == 1 => desc[..10].try_into().ok(),
+        _ => None,
+    };
+    if let Some(words) = srv_words
+        && let Some((base, width)) = buffer_extent(view)
+        && let Some(whole) = crate::shadow::find(base, width)
+    {
+        let desc = srv_desc(words);
+        // SAFETY: buffer_range above established that this is a buffer view.
+        let b = unsafe { desc.Anonymous.Buffer };
+        // SAFETY: the shadow owns a live buffer.
+        let host_width = unsafe { whole.buffer.GetDesc() }.Width;
+        if let Some((start, bytes)) = raw_srv_own_bytes(
+            whole.offset(base), base, b.FirstElement, b.NumElements,
+            b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0,
+            desc.Format, width, host_width,
+        ) && let Some(own) = crate::shadow::exact(start, bytes) {
+            return Some((own, start, bytes));
+        }
+    }
     // A view off its buffer's elements is made on a copy of its own bytes
     // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
     // of the copy they find, so that the copy brought up to date is the
@@ -2169,6 +2193,29 @@ type Kept = Option<ID3D12Resource>;
 fn own_copy_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_OWN_COPY").is_none_or(|v| v != "0"))
+}
+
+/// Experiment: give an unaligned read-only raw view a copy starting at its
+/// first byte, without changing its contents or rounding its address.
+/// Overlapping GPU-written copies need further validation; off by default.
+#[allow(clippy::too_many_arguments)]
+fn raw_srv_own_bytes(offset: u64, base: u64, first: u64, count: u32, stride: u32, raw: bool, format: DXGI_FORMAT, title_width: u64, host_width: u64) -> Option<(u64, u64)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_RAW_SRV_OWN_COPY").is_some_and(|v| v == "1"))
+        || !own_copy_on() || !raw || stride != 0 || format != DXGI_FORMAT_R32_TYPELESS || count == 0
+    {
+        return None;
+    }
+    let first_bytes = first.checked_mul(4)?;
+    let relative = offset.checked_add(first_bytes)?;
+    let len = u64::from(count).checked_mul(4)?;
+    if relative.is_multiple_of(16)
+        || first_bytes.checked_add(len)? > title_width
+        || relative.checked_add(len)? > host_width
+    {
+        return None;
+    }
+    Some((base.checked_add(first_bytes)?, len))
 }
 
 /// The title memory (start, bytes) of a buffer view that cannot be made on
@@ -2309,7 +2356,11 @@ fn buffer_srv(
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
+        // SAFETY: the shadow owns a live buffer.
+        let width = unsafe { shadow.buffer.GetDesc() }.Width;
         match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown)
+            .or_else(|| raw_srv_own_bytes(offset, address, b.FirstElement, b.NumElements, b.StructureByteStride,
+                b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, desc.Format, len, width))
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
