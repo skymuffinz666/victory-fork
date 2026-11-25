@@ -497,3 +497,12 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   that counted changed records only, whose share varies greatly (median 11.5k,
   p90 48.6k). The measured hot path is therefore the per-looked-record `copied`
   mutex, not the page reads or view creation.
+- Texture-keeping fix verification (`keepface1`, 700 s, same settings and no
+  overrides): the diner close-ups `frame-1247.png` and `frame-1287.png` and
+  the prison frames `frame-1351/1399/1447/1495.png` show clean, correctly
+  coloured faces and hair, with no black head or speckled face of the kind in
+  `translated1/frame-1411.png`. The same frames of `phases1` (before this fix)
+  also show clean faces, so this is **not** a controlled A/B proof that the
+  fix removed the black-face symptom; it establishes only that keeping the
+  last host copy when the title unmaps the page does not visibly regress these
+  scenes. No device removal, exception or `id=538` error was logged.
