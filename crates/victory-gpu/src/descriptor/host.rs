@@ -26,9 +26,13 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
-    /// The tag, view index and generation last seen by the pass over
-    /// records copied in as bytes. `None` means never looked at.
-    copied: Mutex<Vec<Option<[u32; 3]>>>,
+    /// The tag, view index and generation last seen by the pass over records
+    /// copied in as bytes. Two atomic words: `low = generation << 32 | index`,
+    /// `high = tag << 1 | 1` (odd means seen). Both are compared, so a write
+    /// in progress by another thread makes a read mismatch and the record is
+    /// mirrored again rather than skipped. This sweep looks at every slot of
+    /// every changed page, and one lock per record was the measured cost.
+    copied: Vec<[std::sync::atomic::AtomicU64; 2]>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -421,7 +425,7 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
 /// ranges dropped because no pass took them; slots made due by such
-/// ranges; and made slots whose memory was found unmapped (made null).
+/// ranges; and slots whose memory was found unmapped (their last host copy is kept).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
@@ -950,7 +954,12 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            copied: Mutex::new(Vec::new()),
+            copied: (0..count)
+                .map(|_| [
+                    std::sync::atomic::AtomicU64::new(0),
+                    std::sync::atomic::AtomicU64::new(0),
+                ])
+                .collect(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1202,8 +1211,9 @@ impl HostHeap {
     /// wrote since the last call ([`remapped`]) and makes the slots whose
     /// placed texture lies there due from the next frame (by when a write
     /// under way has landed): memory that arrived is uploaded, memory that
-    /// went makes the slot null ([`HostHeap::texture_slot_gone`]), and a
-    /// texture streamed into the place of another of the same description
+    /// went is looked at again without throwing away the host copy already
+    /// made (the console keeps the pixels in its own memory), and a texture
+    /// streamed into the place of another of the same description
     /// is uploaded although no descriptor says so. Slots tables read are
     /// left to their draws. Returns how many slots it made due.
     /// shortcut: the ranges are kept in one place for all heaps; the heap
@@ -1403,18 +1413,14 @@ impl HostHeap {
         remade
     }
 
-    /// The memory of the texture title slot `index` views is not mapped
-    /// (any more): a host slot made from it becomes null again, so that
-    /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
-    /// keeps what it views). True if the slot was made.
-    pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made.get(index as usize).is_none_or(|&key| key == 0) {
-            return false;
-        }
-        self.unmake(&mut made, index);
+    /// The memory of a placed texture is not mapped now. The console keeps
+    /// that texture's pixels in its own memory until the title changes the
+    /// view or new bytes arrive, so the host copy already made from it stays
+    /// what the slot shows: making it null here showed black surfaces (faces
+    /// in streamed scenes) while the title still displayed the texture. The
+    /// caller looks at the slot again when its memory arrives. Counts it.
+    pub(crate) fn texture_slot_away(&self) {
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        true
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -1819,21 +1825,20 @@ impl HostHeap {
             u32::from_le_bytes(words[n * 4..n * 4 + 4].try_into().unwrap())
         });
         let key = [tag, i, generation];
+        let low = u64::from(generation) << 32 | u64::from(i);
+        let high = (u64::from(tag) << 1) | 1;
+        let cell = &self.copied[index as usize];
+        // Even a first-seen all-zero record must be mirrored: the slot might
+        // previously have been populated through a descriptor API, so only an
+        // odd high word (seen) means the same record as last time. Comparing
+        // both words keeps another thread's in-progress write from skipping.
+        if cell[0].load(std::sync::atomic::Ordering::Relaxed) == low
+            && cell[1].load(std::sync::atomic::Ordering::Relaxed) == high
         {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, None);
-            }
-            let Some(last) = copied.get_mut(index as usize) else {
-                return false;
-            };
-            // Even a first-seen all-zero record must be mirrored: the slot
-            // might previously have been populated through a descriptor API.
-            if *last == Some(key) {
-                return false;
-            }
-            *last = Some(key);
+            return false;
         }
+        cell[0].store(low, std::sync::atomic::Ordering::Relaxed);
+        cell[1].store(high, std::sync::atomic::Ordering::Relaxed);
         self.mirror_record(index, handle, false, key);
         true
     }
@@ -1863,11 +1868,16 @@ impl HostHeap {
         // sweeps. If the title later copies the old record back as bytes,
         // the sweep must not mistake it for the host slot's current value.
         {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(last) = copied.get_mut(index as usize)
-                && last.is_some_and(|old| old != [tag, i, generation])
-            {
-                *last = None;
+            let cell = &self.copied[index as usize];
+            let low = u64::from(generation) << 32 | u64::from(i);
+            let high = (u64::from(tag) << 1) | 1;
+            let seen = cell[1].load(std::sync::atomic::Ordering::Relaxed);
+            if seen != 0 && (cell[0].load(std::sync::atomic::Ordering::Relaxed) != low || seen != high) {
+                // A descriptor API or draw can mirror a newer record between
+                // heap sweeps. If the title later copies the old record back
+                // as bytes, the sweep must not mistake it for the host slot's
+                // current value: clear what it last saw.
+                cell[1].store(0, std::sync::atomic::Ordering::Relaxed);
             }
         }
         self.mirror_record(index, handle, for_draw, [tag, i, generation])

@@ -822,6 +822,29 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
+/// An LDS instruction whose effect depends on the dword already there AND
+/// cannot be left unordered with the other half. A commutative RMW whose old
+/// value nobody reads (`ds_add_u32`, `ds_min_u32`, `ds_or_b32`, ...) is only a
+/// write here: both host waves doing it on one dword leave the same value, so
+/// the "two writes do not alias" shortcut stays sound. The `_rtn` forms and
+/// non-commutative RMWs also want a specific old value, so they must not be
+/// taken as plain writes.
+fn lds_atomic(name: &'static str) -> bool {
+    (name.contains("_rtn")
+        && (name.starts_with("ds_add")
+            || name.starts_with("ds_min")
+            || name.starts_with("ds_max")
+            || name.starts_with("ds_and")
+            || name.starts_with("ds_or")
+            || name.starts_with("ds_xor")))
+        || name.starts_with("ds_sub")
+        || name.starts_with("ds_cmpst")
+        || name.starts_with("ds_wrxchg")
+        || name.starts_with("ds_swap")
+        || name.starts_with("ds_reset")
+        || name.starts_with("ds_bfi")
+}
+
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
 /// group barrier) at its start and before its exit. `None` if barriers cannot keep the
@@ -834,7 +857,9 @@ fn meeting_mode() -> u32 {
 /// there: before the exit of an all-lane block into a region with LDS accesses, and at the
 /// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
+/// joined without an all-lane block between them): refused. An LDS arithmetic
+/// or bit op that also reads the old value counts as both a write and a read;
+/// a commutative op whose old value nobody sees stays a write.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
@@ -879,6 +904,11 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
                 reads[r] = true;
             } else {
                 writes[r] = true;
+                if lds_atomic(name) {
+                    // An LDS arithmetic or bit op also wants the dword that is
+                    // there, so the halves' order matters for it as for a read.
+                    reads[r] = true;
+                }
             }
         }
     }

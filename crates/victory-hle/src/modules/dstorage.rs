@@ -368,6 +368,9 @@ struct Lane {
     clock: u64,
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
+    /// Left out when the queue submitted itself, until the title's Submit:
+    /// reads into physical pages and the status entries behind them.
+    held: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Request)>,
@@ -589,8 +592,18 @@ impl Lanes {
         }
     }
 
-    /// Moves a queue's enqueued commands to the workers.
+    /// Moves a queue's enqueued commands to the workers (the title's Submit).
     fn submit(&mut self, id: u64) {
+        self.submit_as(id, true);
+    }
+
+    /// As [`Lanes::submit`]; `explicit` false when a half-full queue submits
+    /// itself, which leaves reads into physical pages for the title's Submit:
+    /// their page lists point into the title's page table, which the title
+    /// fills for the batch in its own submit path, right before Submit
+    /// (`sub_1400e88f0`), so until then they name no page or a page that now
+    /// holds something else. A status entry behind a held read waits with it.
+    fn submit_as(&mut self, id: u64, explicit: bool) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -609,7 +622,18 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        for command in std::mem::take(&mut lane.unsubmitted) {
+        let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
+        commands.append(&mut lane.unsubmitted);
+        for command in commands {
+            let hold = !explicit
+                && match &command {
+                    Command::Read(r) => r.options & PAGE_DESTINATION != 0,
+                    Command::Status(_) => !lane.held.is_empty(),
+                };
+            if hold {
+                lane.held.push(command);
+                continue;
+            }
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
@@ -628,6 +652,7 @@ impl Lane {
             capacity: usize::from(capacity),
             clock: 0,
             unsubmitted: Vec::new(),
+            held: Vec::new(),
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
@@ -638,7 +663,11 @@ impl Lane {
 
     /// Requests and status entries held, submitted or not.
     fn entries(&self) -> usize {
-        self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
+        self.unsubmitted.len()
+            + self.held.len()
+            + self.reads.len()
+            + self.statuses.len()
+            + self.running.len()
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -686,6 +715,7 @@ fn close_lane(id: u64) {
     };
     lane.closed = true;
     lane.unsubmitted.clear();
+    lane.held.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
@@ -797,6 +827,16 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        // Full with reads held for a Submit the title cannot make while it
+        // waits here: they go now, page lists as they are.
+        if !lane.held.is_empty() {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("dstorage: a full queue's reads into physical pages start before the title's Submit");
+            }
+            lanes.submit(id);
+            scheduler.work.notify_all();
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -807,8 +847,19 @@ fn queue(this: QueueRef, command: Command) {
     };
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id);
+        let capacity = lane.capacity;
+        lanes.submit_as(id, false);
         scheduler.work.notify_all();
+        let held = lanes.lanes.get(&id).map_or(0, |l| l.held.len());
+        let n = AUTO_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(
+                n,
+                capacity,
+                held,
+                "dstorage: a queue half full submitted itself; reads into physical pages wait for the title's Submit"
+            );
+        }
     }
 }
 
@@ -819,7 +870,7 @@ extern "system" fn submit(this: QueueRef) {
         return;
     };
     let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
+    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
     scheduler.work.notify_all();
@@ -1149,6 +1200,9 @@ fn into_destination(
         Err(E_INVALIDARG)
     }
 }
+
+/// Queues that submitted themselves, half full (diagnostics).
+static AUTO_SUBMITS: AtomicU32 = AtomicU32::new(0);
 
 /// Slots by the 2020 order, which the argument shapes at
 /// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).

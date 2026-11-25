@@ -1869,8 +1869,11 @@ impl State {
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
-                    // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
+                    // Streamed out: the console still shows the pixels it
+                    // uploaded, so the host copy made from that memory stays
+                    // what the slot shows until new bytes or a new view
+                    // arrive. Nulling it showed black faces and clothes.
+                    host.texture_slot_away();
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
