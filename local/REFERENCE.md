@@ -506,3 +506,22 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   fix removed the black-face symptom; it establishes only that keeping the
   last host copy when the title unmaps the page does not visibly regress these
   scenes. No device removal, exception or `id=538` error was logged.
+- Atomic descriptor-record cache (`cb8be21`, uncommitted predecessor of this
+  note measured in `atomic1`): replacing the per-record `copied` mutex with two
+  exact atomic words per slot changed the median `sync_heaps` line from 23.31
+  ms (`keepface1`, 202 samples) to 22.26 ms (`atomic1`, 397 samples) with
+  slightly MORE work per frame (209 vs 192 pages, 37.9k vs 35.1k mirrored),
+  and p90 from 35.18 to 27.45 ms. That is a modest improvement, not the ~7 ms
+  the phase instrumentation suggested; scenes and capture schedules differ, so
+  no fps claim follows. No device removal, exception or `id=538` error.
+- LDS read-modify-write refinement: the first version of `lds_atomic` counted
+  every `ds_add`/`ds_min`/`ds_or` etc. as a read, which made three previously
+  accepted programs refuse (`89d08e561897d4e5` and `55679a0547649d0b`, tree
+  batch cull; `1f1fbd86759b3da2`, projection decal classification). Their
+  regions use *commutative RMW without a returned old value*, where two host
+  waves leave the same dword regardless of order, so those now stay writes;
+  `_rtn` forms and non-commutative RMWs (`ds_sub`, `ds_cmpst`, `ds_wrxchg`,
+  `ds_swap`, `ds_reset`, `ds_bfi`) count as reads. Offline (`translate --list
+  --validate --pipelines`, host wave 32) all three validate and create host
+  pipelines again, while the original seven wave64 programs still validate
+  but create 0 pipelines.
