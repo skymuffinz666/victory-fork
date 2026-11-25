@@ -400,9 +400,21 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   fence serialization, not staging. `heap buffers 120.0 ms` is `draw.rs:1399-1550`
   **including** `heap_textures` at `draw.rs:1532`: buffer refresh and texture
   staging share one timer and are not split yet. `descriptor::sync_heaps`
-  (`descriptor.rs:172`, once per submission, one kernel read per 4 KiB page,
-  ~221 pages and ~43k mirrored slots) runs before the `preparing` timer starts
-  at `host.rs:4020`, so its 24–33 ms/frame is unattributed in the frame line.
+  (`descriptor.rs:172`, once per submission, one kernel read per dirty
+  64 KiB page — `watch::PAGE` is `64 << 10` at `watch.rs:32`, not 4 KiB — and
+  ~195 dirty pages and ~40k mirrored slots at a measured median frame) runs
+  before the `preparing` timer starts at `host.rs:4020`, so its 20–33 ms/frame
+  is unattributed in the frame line. A least-squares fit over the 975 frame
+  lines from the four runs built after `467f7eb` (`c_quadhelpers1`,
+  `c_translated1`, `c_shadersave2`, `c_wide4`) separates the costs:
+  ~0.038 ms per page read, ~0.011 ms per thousand slots looked at and
+  ~0.369 ms per thousand slots mirrored (R² 0.93), so **the per-slot mirror
+  work is ~74% of that cost and the kernel page reads ~30%**: batching whole
+  dirty runs into single reads is worth at most ~6.7 ms/frame and only if the
+  ~6 dirty pages per submission are adjacent, whereas `mirror_record`
+  (`descriptor/host.rs:1879`, locking `copied` then `made` per record) is the
+  measured hot path. The fit is confounded for pre-`467f7eb` runs, which hashed
+  each record with BLAKE3 and cost ~22 ms/frame more.
   Card limits (`shadow.rs:154-158`: 1 MiB/1024 MB) already equal `boot.ps1`'s
   `-speed` values, so those two settings are no-ops. Many paths Hy4 checked are
   already default-on (`VICTORY_HEAP_SYNC`, `VICTORY_VIEW_INLINE`,
@@ -454,3 +466,24 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   requires replicated LDS with a sound sync point for such regions, which the
   fork does not have; the uniform-mask shortcut written on the way was reverted
   because those edges are `Lane`/`Opaque` and it changed no saved container.
+- The seven compute pipeline refusals were re-measured offline (`VICTORY_HOST_MAX_WAVE=32`,
+  `VICTORY_WAVE_WHY=1`): all four single-console-wave-group programs are refused
+  first by `lds_meetings()` returning `None` at `lower.rs:885-887`, because one
+  per-lane branch region holds **both** an LDS read and an LDS write; their
+  console ISA contains **no `s_barrier` at all**, so the title relies on the
+  console's 64-lane wave lockstep for that ordering. `CS_Visibility`
+  (`369cbe906ea72764`) is explicit: a lane-0-only region `0x58`–`0x80` writes
+  LDS at `0x68`/`0x70`/`0x78`, and a second region `0x494`–`0x4cc` has
+  `ds_read2_b32` at `0x4a0` with `ds_write*` at `0x4a8`, `0x4c4` and `0x4cc`;
+  `CS_Tiling_Generate_Opaque` (`2cc4c197ee29e291`) likewise writes at `0x198`
+  and `0x488` and reads at `0x49c`/`0x4dc`/`0x758` with dozens of `v_cmpx_*`
+  narrowing EXEC. Additionally `ds_add_rtn_u32`/`ds_add_u32` at
+  `0x390`/`0x3a8`/`0x434`/`0x43c` in the visibility program are LDS atomics that
+  the classification at `lower.rs:878-882` calls writes, so the code falls back
+  on the "two writes in one region do not alias" shortcut documented at
+  `lower.rs:838` — which an LDS atomic invalidates. This is why the digest-gated
+  experiment that forced the exchange lowering for those four produced
+  pipelines but rendered the diner wrong: the two host waves race on the same
+  LDS addresses with no barrier. Completing the refusals needs an ordering
+  primitive for intra-region LDS read-after-write across two host waves
+  (replicated LDS with a sound, uniform sync point), not a switch.
