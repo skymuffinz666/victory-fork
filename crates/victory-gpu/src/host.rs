@@ -1163,6 +1163,16 @@ fn record_plane_pass(
     }
 }
 
+/// Opt-in correlation with resource pointers reported by the D3D12 debug layer.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_resource_copy(kind: &str, to: &ID3D12Resource, from: &ID3D12Resource) {
+    use windows::core::Interface;
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("VICTORY_TRACE_RESOURCE_COPIES").is_some()) {
+        tracing::info!(kind, destination = ?to.as_raw(), source = ?from.as_raw(), "resource copy recorded");
+    }
+}
+
 /// Records into `list` the copy of a depth texture into its colour twin
 /// (`colour`) or of the twin into the depth texture, both already in their
 /// copy states: whole textures of one size in one format family, which the
@@ -1190,6 +1200,8 @@ fn record_twin_copy(
         crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
     }
     let Some(through) = &twin.through else {
+        #[cfg(feature = "diagnostics")]
+        trace_resource_copy("depth twin", to, from);
         // SAFETY: an open list and two live textures.
         unsafe { list.CopyResource(to, from) };
         return;

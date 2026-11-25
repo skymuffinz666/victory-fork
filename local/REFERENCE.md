@@ -176,6 +176,27 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   semantics; taking either side alone would silently miscompile. No change landed.
 
 ### Intro visual baseline and texture-budget caveat
+- Full-translation caveat: the default wave64 retry allows explicitly
+  approximate half-wave lowering (`emit/mod.rs`, `VICTORY_WAVE_LOCAL` unset).
+  The `cachefix1` fresh-translation log contains 22 successful approximate
+  retry messages; concurrent log ordering does not by itself associate all
+  of them with shader hashes. A single-thread offline probe confirmed compute
+  `2561af9577c47289` uses approximate wave32 lowering by default (DXIL
+  validates and a pipeline is created), whereas `VICTORY_WAVE_LOCAL=idiom`
+  refuses it at `0x377c` (wave reduction under divergent execution). Neither
+  path was executed in that probe; no console-equivalence or causal relation
+  to the visual defect is established. Strict refusal avoids that approximate
+  fallback but also drops work; it is not full translation or a visual fix.
+- In `intro_trace1` frame 1247 the missing torso and room also appear as
+  black regions in the captured albedo-like intermediate target
+  `frame-1247-13-0xfc739a6d40-2560x1440-f27.png`. This places the symptom
+  at or before that target, but does not distinguish missing draws from
+  clipping, depth rejection, or other causes. The same frame's diagnostic
+  summary reports many main-pass draws with a small scissor rectangle.
+  `VICTORY_SCISSOR_TEST=full` is an existing, off-by-default probe that
+  widens title scissors globally. It changes intended rendering and can
+  affect other passes, so it is not a fix and its result is not conclusive
+  on its own. Compare the matching scene and intermediate targets.
 - `nodump1` ran with intermediate target dumping disabled and produced 148
   final-frame images and no intermediate target images. Its `frame-1246.png`
   still shows the missing torso and room, like the earlier kitchen capture;
@@ -194,8 +215,16 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   the default remains 192 MB. A larger upload total does not demonstrate that
   the textures needed by the visible scene arrived correctly.
 - The debug-layer `blend1` log reports D3D12 CopyResource destination-state
-  errors (id 538) later in the run. Their source and relation to the missing
-  geometry or textures have not been established.
+  errors (id 538) later in the run. Their relation to the missing geometry
+  or textures has not been established.
+- `copytrace1` with the D3D12 debug layer and resource-copy tracing reported
+  119 id 538 errors for a single host resource; corresponding title copy
+  records had that same host resource as source and destination. `copyfix1`
+  preserves the source upload but treats a whole-resource self-copy as a
+  no-op: 57 self-copies were skipped, with zero id 538 errors, no logged
+  unhandled exception or device removal, and seven compute pipeline refusals.
+  `frame-1372.png` still shows the missing room. This verifies the observed
+  debug-layer error was avoided, not that overall rendering is correct.
 - `intro_trace1` reproduced the defect in `frame-1247.png`: missing torso and
   room geometry. `frame-1247-ops.txt` recorded four refused compute dispatches,
   135 disabled BVH-builder dispatches, and no refused pixel shader in that

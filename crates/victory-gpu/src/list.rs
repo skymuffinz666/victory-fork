@@ -858,6 +858,16 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
+            // CopyResource requires distinct resources. When two title
+            // resources resolve to the same host texture, copying the whole
+            // texture onto itself has no effect. Keep the source upload above:
+            // it may still be needed to make title memory visible on the host.
+            use windows::core::Interface;
+            if to.as_raw() == from.as_raw() {
+                #[cfg(feature = "diagnostics")]
+                crate::host::trace_resource_copy("title self-copy skipped", to, from);
+                return;
+            }
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
@@ -866,6 +876,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            #[cfg(feature = "diagnostics")]
+            crate::host::trace_resource_copy("title", to, from);
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
