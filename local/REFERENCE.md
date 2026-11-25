@@ -106,3 +106,20 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
 - Still open: compute pipelines refused for wave64 on a 32-lane device
   (`02384a60fda6f2d0`, `2cc4c197ee29e291`, `2da4beb386509b77`, `369cbe906ea72764`);
   some backlit scenes in `blend1` (1245/1253/1261) still show dark silhouettes.
+
+### Remaining compute refusals — measured reasons (2026-11-25)
+- `c_wave1_stderr.txt` with `VICTORY_WAVE_WHY=1`: 8 `Shader wants wave lane count of 64 but
+  maximum ... is 32` warnings. The built-in retries fail for concrete reasons:
+  `a lane mask exchanged where not every lane runs is not supported` (0x1eb4),
+  `a count or sum over the wave used as data` (0x1a34),
+  `a lane mask read as data in a half-wave` / `a constant lane mask in a half-wave` (0xdc70,
+  0x9a84), and LDS in a 64-thread group with a read and write in one lane-branch region.
+- Upstream/other projects: `upstream/main` has no commits since our base `310c6eb`.
+  PR #1845's wave64 lowering (`351e728`) is already present in our base (the `APPROXIMATE`
+  retry paths are in `emit/mod.rs`). Its lane-mask commit `c624d98` was tried on a temporary
+  branch: 10 conflicts / 720 inserted lines against our newer `phi_joins` and split-mask
+  code in `emit/lower.rs` and `structure.rs`. Taking the upstream side would regress those,
+  so the cherry-pick was aborted and no change was committed. Do not retry without a
+  deliberate merge of both implementations.
+- The 64 MB pipeline-worker stack fix (`Peppacodes` `d09c31b`) addresses `E_OUTOFMEMORY` on a
+  different 5080 pipeline; our refusals are `E_INVALIDARG` from wave size, so it does not apply.
