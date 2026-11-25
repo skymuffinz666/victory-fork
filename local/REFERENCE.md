@@ -185,11 +185,18 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   address or format there. A correct implementation still needs the actual
   bound view and its record count: inferring a raw host view from the stride
   alone is unsafe because the host may bind a structured view instead.
-- Offline, enabling `VICTORY_ASSUME_DATA_DESCRIPTOR_2D=1` also enabled the
-  upstream raw-buffer assumption and made `ceb5eb68cd99cb07` validate and
-  create a host pipeline; it did not execute or establish correct results.
-  The assumptions remain off by default until the bound views and actual
-  counts are verified.
+- Default translation fix for data-only descriptors: `descriptor_data()` now
+  calls `unused_descriptor_kind` whenever a load has no image/buffer use or
+  twin. For an 8-dword load it requires a dimension field (dwords 1-4) to be
+  read and rebuilds width/height/levels from `getDimensions` on the view the
+  load's own index selects; address and format dwords remain `Val::Missing`
+  and fail at the consumer rather than becoming invented numbers. For a
+  4-dword load it requires dword 2 (record count). Offline, with no switches,
+  all seven saved refused containers (6 pixel + `ceb5eb68cd99cb07`) now
+  translate, validate with `dxil.dll`, and create host pipelines. None was
+  executed: pipeline creation is not proof of console-equivalent pixels.
+  Full shader suite: 211 passed, 4 pre-existing one-ULP BVH failures (also
+  present at `fc1e67c`, before this change), 3 ignored.
 - Hy4's frame-timing review found that the logged CPU/GPU counters overlap
   and must not be summed. The menu reaches 30 fps; world scenes reached
   roughly 3.5–5.7 fps in the saved logs, with texture upload and card-copy

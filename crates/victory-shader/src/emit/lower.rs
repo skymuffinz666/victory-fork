@@ -5710,12 +5710,12 @@ impl<'a> Lower<'a> {
         // texture picked from the heap by an index in a constant buffer, its width and
         // height turned into a texel size; a buffer tested for being empty by its record
         // count): the kind from its dwords and its used-resource entry.
-        // A data-only descriptor does not itself prove the view dimension or
-        // that its dynamically selected host slot is populated. Keep the
-        // upstream 2D assumption experimental until those facts are known.
-        let unused = if use_at.is_none()
-            && std::env::var_os("VICTORY_ASSUME_DATA_DESCRIPTOR_2D").is_some_and(|v| v == "1")
-        {
+        // A descriptor nothing uses as one, whose dwords are read as numbers,
+        // is rebuilt from the host view it selects. The image form is used
+        // only when the code reads dimension fields (dwords 1-4); fields with
+        // no host value (address, format, tiling) stay missing and refuse at
+        // the consumer rather than becoming fabricated numbers.
+        let unused = if use_at.is_none() {
             self.unused_descriptor_kind(inst, site, code, count)
         } else {
             None
