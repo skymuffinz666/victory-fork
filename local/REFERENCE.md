@@ -167,3 +167,10 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   `host mesh pipeline refused` **0**, no exceptions, dynamic tables asked per report
   median ~5,193 (was ~7,590 in `final1`) with 0 refused. Scene mix differs, so this
   is indicative rather than a controlled speed result; no regression was measured.
+- PR #1845's other two commits were **not** merged. `351e728` (wave64 lowering) is
+  already in our base. `c624d98` (uniform/constant lane masks in selects and phis)
+  was re-tried with `cherry-pick -n` to merge deliberately: it rewrites the select-mask
+  path our base has since extended with `MaskData::Console` constant halves, wave64
+  high-SGPR handling and back-edge `phi_joins`, so the conflicts are in core lowering
+  logic, not tests. A union cannot be verified as correct without re-porting those
+  semantics; taking either side alone would silently miscompile. No change landed.
