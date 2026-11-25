@@ -197,6 +197,15 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   executed: pipeline creation is not proof of console-equivalent pixels.
   Full shader suite: 211 passed, 4 pre-existing one-ULP BVH failures (also
   present at `fc1e67c`, before this change), 3 ignored.
+- In-game verification `translated1` (900 s runner, all experimental switches
+  off): translation failures fell from 10 in `prologue1` to **1**
+  (`926c46bab3b86bd6`, "a lane mask holding lanes elsewhere read as data",
+  `0x13c8`); the seven data-only pixel/compute shaders no longer fail. Seven
+  compute pipelines are still refused on wave size. No unhandled exception,
+  device removal, or `id=538` copy error. Late frames (~3.4–4.5 fps) show the
+  characters with clean faces and clothing and no block artifacts. The last
+  failing shader has no saved container, so it cannot be reproduced offline
+  yet; the run was stopped by the runner (`exited=True`), not a natural exit.
 - Hy4's frame-timing review found that the logged CPU/GPU counters overlap
   and must not be summed. The menu reaches 30 fps; world scenes reached
   roughly 3.5–5.7 fps in the saved logs, with texture upload and card-copy
