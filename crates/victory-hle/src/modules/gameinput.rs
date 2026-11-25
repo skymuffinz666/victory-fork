@@ -1198,43 +1198,100 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key that
+    /// long after input starts, with or without focus. A key is a letter, a
+    /// digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`
+    /// (the stand-in pad's table maps them to buttons). `VICTORY_KEYS_HOLD_MS`
+    /// sets the hold length (default 200 ms).
+    ///
+    /// `VICTORY_KEYS_MASH=<key>,<key>,...` cycles one of those keys every
+    /// `VICTORY_KEYS_MASH_EVERY` seconds (default 2), held for the same time.
+    /// It drives a title's menus without a window in focus, to see how far a
+    /// boot gets; it presses the stand-in pad and the keyboard device alike.
+    ///
+    /// `VICTORY_KEYS_FILE=<path>` holds the comma-separated keys in that file
+    /// while they are there, re-reading it every 50 ms: a running boot can be
+    /// driven live, one capture at a time.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+        struct Script {
+            start: Instant,
+            scheduled: Vec<(Duration, u8)>,
+            mash: Vec<u8>,
+            every: Duration,
+            hold: Duration,
+            control: Option<String>,
+            control_keys: Mutex<(Instant, Vec<u8>)>,
+        }
+        fn key(s: &str) -> Option<u8> {
+            match s.trim() {
+                "Enter" => Some(0x0D),
+                "Esc" => Some(0x1B),
+                "Tab" => Some(0x09),
+                "Back" => Some(0x08),
+                "Up" => Some(0x26),
+                "Down" => Some(0x28),
+                "Left" => Some(0x25),
+                "Right" => Some(0x27),
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    Some(k.as_bytes()[0].to_ascii_uppercase())
+                }
+                _ => None,
+            }
+        }
+        static SCRIPT: LazyLock<Script> = LazyLock::new(|| {
+            let hold = std::env::var("VICTORY_KEYS_HOLD_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(Duration::from_millis(200));
+            let scheduled = std::env::var("VICTORY_KEYS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|entry| {
+                    let (at, name) = entry.split_once(':')?;
+                    Some((Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?, key(name)?))
+                })
+                .collect();
+            let mash = std::env::var("VICTORY_KEYS_MASH")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(key)
+                .collect();
+            let every = std::env::var("VICTORY_KEYS_MASH_EVERY")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .and_then(|v| Duration::try_from_secs_f64(v).ok())
+                .unwrap_or(Duration::from_secs(2));
+            let control = std::env::var("VICTORY_KEYS_FILE").ok().filter(|s| !s.is_empty());
+            Script { start: Instant::now(), scheduled, mash, every, hold, control,
+                     control_keys: Mutex::new((Instant::now(), Vec::new())) }
         });
-        let (start, keys) = &*SCRIPT;
+        let Script { start, scheduled, mash, every, hold, .. } = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+        let mut down: Vec<u8> = scheduled
+            .iter()
+            .filter(|&&(at, _)| (at..at + *hold).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        if !mash.is_empty() && !every.is_zero() {
+            let step = now.as_secs_f64() / every.as_secs_f64();
+            let phase = now - Duration::try_from_secs_f64(step.floor() * every.as_secs_f64())
+                .unwrap_or_default();
+            if phase < *hold {
+                down.push(mash[step as usize % mash.len()]);
+            }
+        }
+        if let Some(path) = &SCRIPT.control {
+            let mut cached = SCRIPT.control_keys.lock().unwrap_or_else(|e| e.into_inner());
+            if cached.0.elapsed() >= Duration::from_millis(50) {
+                let held = std::fs::read_to_string(path).unwrap_or_default();
+                cached.1 = held.split(',').filter_map(key).collect();
+                cached.0 = Instant::now();
+            }
+            down.extend(cached.1.iter().copied());
+        }
+        down
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
