@@ -168,6 +168,23 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// One console wave64 sharing LDS without a console `s_barrier` can run as
+/// two host waves of 32 only if both reach a group barrier between the write
+/// and the read. For this one program the conflicting region uses constant
+/// dwords and one branch; widening that branch makes both waves reach the
+/// per-access barriers that `split_lds` adds. Approximate half-wave lowering
+/// must be off here: it would make a pipeline with no group barrier and the
+/// two waves would race on the same LDS dwords. `VICTORY_LDS_FLOW=1` is
+/// experimental (its name is in the translation cache key).
+pub(crate) fn lds_flow(c: &Container) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_FLOW").is_some_and(|v| v == "1"))
+        && c.digest
+            == [
+                0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c,
+            ]
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a
@@ -387,7 +404,7 @@ pub fn emit(
         // the same way last of all, each half-wave giving its own results
         // (approximate: a tile-wide result becomes two half-tile ones);
         // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom") || lds_flow(c);
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
@@ -425,7 +442,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || lds_flow(c);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {

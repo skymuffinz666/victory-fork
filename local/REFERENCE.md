@@ -621,3 +621,14 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   1/31/32/33/64 writers), must keep `VICTORY_GROUP_SYNC=2` and the approximate
   local fallback off, and must be aborted on any device loss or slower
   submissions. No code was changed from this review.
+- First narrow landing of that idea (`VICTORY_LDS_FLOW=1`, opt-in, digest
+  allowlist containing only `369cbe906ea72764`): the gate enables `widen()`
+  for this program and makes the approximate half-wave fallback strict, so a
+  pipeline can only come from the widened branch form with `split_lds` group
+  barriers. Offline on RTX 5080 host wave 32: `WAVE64-WIDE 1 branches taken
+  wave-wide`, wave 32, 1/1 DXIL validated, 1/1 pipeline; 19 `dx.op.barrier`
+  calls (mode 9) around the LDS stores in the emitted DXIL. All seven other
+  refused computes still emit/validate but create 0 pipelines, and the unit
+  suites are unchanged. The gate is in the translation cache key. An in-game
+  run (`ldsflow1`, 1000 s) is running to check for device loss, slow
+  submissions and any new image artefact; this is NOT yet a default fix.
