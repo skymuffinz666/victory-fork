@@ -142,3 +142,15 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   and 1/frame each for four refused wave64 compute hashes. So there is no large pool of
   recoverable draws hiding behind that counter; do not optimise it further without a
   different measurement.
+
+### Speed switch and descriptor-diagnostic probes (2026-11-25)
+- `VICTORY_D3D12_BACKGROUND=0` (`c_bg0_stderr.txt`) logged
+  `the host's background shader work is switched off ... ok=false`: this driver refused
+  `SetBackgroundProcessingMode`. Its higher fps median (1.20 vs 0.80 on world frames) is
+  not attributable to the switch; do not add it to the default speed set.
+- `VICTORY_DESC_WHY=1` (`c_descwhy_stderr.txt`) measured the remaining pixel-shader
+  translation failures: all are `s_load_dwordx8` loads at offsets `0x1c14`–`0x1e2c`,
+  reading 8-dword descriptors from root params 288/289 with a dynamic index
+  (`Value(8184)`–`Value(9225)`), `lane_copied=false`. The translator refuses them as
+  `a descriptor read only as data` (6 failures in that run). Supporting them would need
+  a host-side descriptor representation, not a flag; not attempted.
