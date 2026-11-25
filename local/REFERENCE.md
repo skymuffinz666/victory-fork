@@ -433,3 +433,24 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   then `0b0074e` and `3973179` (thread affinity, meters, off-by-default
   `VICTORY_JOIN_PARTS`/`VICTORY_BACK_OWN_VIEW`) once the chain is reconciled.
   `f85101b` needs its default-on `VICTORY_FILL_WAIT` reviewed before adoption.
+- Last translation refusal `926c46bab3b86bd6` (`CS_TransmissionVolumetricsSubmerged`)
+  root-caused offline (`VICTORY_HOST_MAX_WAVE=32`, one job, with a temporary
+  `VICTORY_MASK_WHY` print added, read and reverted): the mask whose dword is
+  read as data is **loop-carried**, and its Bool support is a single
+  `Atom::Phi` whose incoming edges are a `Lane` atom (a VALU compare bit, on
+  the back edge) and an `Opaque` atom. The mask is therefore genuinely
+  lane-dependent: its dword has to be the ballot of the lanes, and no uniform
+  shortcut applies. `Structured.active` never takes such a phi (only EXEC phis
+  at `structure.rs:677-680`), while the `s_cselect_b64 s[2:3], exec, 0` *inside*
+  the loop does reach `active` at `structure.rs:1213-1220`: the failing value is
+  the phi at the second entry of the rotated loop (`s_branch label_13C8` at
+  `0x13a8`, back edge `s_cbranch_scc0 label_13B0` at `0x42a0`), and `fill_phis`
+  (phi/carry-in lowering) is what reports the refusal at the block offset
+  `0x13c8`. This program also has no cross-half exchange (`exchange=None`): the
+  wave64 lowering at `lower.rs:1334` rejected splitting because one per-lane
+  branch region holds **both** an LDS read and an LDS write, so `lds_meetings`
+  returned `None` at `lower.rs:885-887` (a group barrier cannot be placed inside
+  a region one half of the console wave may skip). Completing translation
+  requires replicated LDS with a sound sync point for such regions, which the
+  fork does not have; the uniform-mask shortcut written on the way was reverted
+  because those edges are `Lane`/`Opaque` and it changed no saved container.
