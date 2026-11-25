@@ -188,9 +188,16 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
 - Offline, enabling `VICTORY_ASSUME_DATA_DESCRIPTOR_2D=1` also enabled the
   upstream raw-buffer assumption and made `ceb5eb68cd99cb07` validate and
   create a host pipeline; it did not execute or establish correct results.
-  `VICTORY_ASSUME_DATA_BUFFER_RAW=1` now selects only the four-dword buffer
-  assumption, separately from the 2D-texture assumption. It remains off by
-  default until the bound view and actual count are verified.
+  The assumptions remain off by default until the bound views and actual
+  counts are verified.
+- Hy4's frame-timing review found that the logged CPU/GPU counters overlap
+  and must not be summed. The menu reaches 30 fps; world scenes reached
+  roughly 3.5–5.7 fps in the saved logs, with texture upload and card-copy
+  passes as the large variable costs. One measured, contained candidate was
+  the hundreds of separate GPU rehash passes per frame; touching 64 KiB
+  pieces are now grouped into one pass per contiguous run by default. This
+  preserves the exact piece set and cannot lose a detected shader write,
+  but the change has only passed a build check; no FPS claim follows.
 - `quadhelpers1` ran with `VICTORY_PIXEL_QUAD_HELPERS=1` and was stopped at
   the user's request; `exited=True` in its runner output reflects that stop,
   not a natural exit. It reached the prison corridor (`frame-3106.png`), with
