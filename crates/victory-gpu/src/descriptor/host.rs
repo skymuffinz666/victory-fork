@@ -578,17 +578,35 @@ impl TextureQueue {
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let count = max.min(again.len() + fresh.len());
+        // A time-limited pass may stop after one slot, so rotate its first
+        // choice across frames as well as within the pass. Retries must not
+        // take the whole budget: a backlog of unmapped or partial textures
+        // otherwise leaves the textures of the shot on screen dark.
+        let mut retry = frame & 1 == 0;
+        let mut newest = fresh.is_empty() || frame & 2 == 0;
+        let (mut ai, mut fi, mut fo) = (0, 0, fresh.len());
+        let mut order = Vec::with_capacity(count);
+        while order.len() < count {
+            if ai < again.len() && (retry || fi == fo) {
+                let (_, index, write) = again[ai];
+                ai += 1;
+                order.push((index, write));
+            } else {
+                let at = if newest {
+                    let at = fi;
+                    fi += 1;
+                    at
+                } else {
+                    fo -= 1;
+                    fo
+                };
+                let (_, index, write) = fresh[at];
+                order.push((index, write));
+                newest = !newest;
             }
+            retry = !retry;
         }
-        order.truncate(max);
         order
     }
 

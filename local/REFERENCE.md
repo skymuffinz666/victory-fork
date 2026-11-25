@@ -525,3 +525,19 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   --validate --pipelines`, host wave 32) all three validate and create host
   pipelines again, while the original seven wave64 programs still validate
   but create 0 pipelines.
+- Borrowed from DexNom's public fork (Radeon-based, no transferable reflection
+  fix; only architecture-neutral items taken, no AMD/RT switches): (1) cube
+  gradient LOD now uses DXIL `log2` directly and applies the console's minimum
+  level for `_cl` samples where `sampleLevel` has no clamp operand, instead of
+  `ln * 1/ln2` (`lower.rs:9940`); (2) `TextureQueue::due` alternates retries
+  with first looks and rotates the first choice across frames, so a backlog of
+  unmapped/partial textures cannot spend the whole staging pass before the
+  textures of the shot on screen (`descriptor/host.rs:570`); (3) `mapped_bytes`
+  no longer returns zero when both ends are uncommitted but interior mips are
+  resident, and the VirtualQuery walk skips `PAGE_NOACCESS`/`PAGE_GUARD` runs
+  (`texture.rs:1296`); (4) pipelines with no colour target and depth writes on
+  are queued ahead of other background work, so shadow/depth passes are ready
+  for later draws (`pipeline/make.rs:221`). `cargo check -p victory-gpu` and
+  139 victory-gpu tests pass; the shader suite remains 211 pass / 4 pre-existing
+  one-ULP BVH failures. In-game verification of these four is pending (the
+  `mirror2` dump run used the previous binary).

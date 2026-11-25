@@ -9937,11 +9937,13 @@ impl<'a> Lower<'a> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    // DXIL's log2 already returns log2 (no multiply by
+                    // 1/ln2, which only adds a rounding step). A footprint of
+                    // zero gives minus infinity, which the sampler takes as
+                    // level 0. `sampleLevel` has no clamp operand, so apply
+                    // the console's minimum level before passing it.
+                    let lod = self.unary(23, texels);
+                    let lod = if has_cl { self.binary(35, lod, clamp) } else { lod };
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(

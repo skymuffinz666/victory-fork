@@ -208,6 +208,16 @@ impl GraphicsState {
         )
     }
 
+    /// A shadow map or depth prepass: no colour target, depth writes on.
+    /// Several later draws need such a pass, so its pipeline is worth making
+    /// first when the workers are otherwise idle.
+    pub(super) fn writes_depth_only(&self) -> bool {
+        self.targets.NumRenderTargets == 0
+            && self.depth_format != DXGI_FORMAT_UNKNOWN
+            && self.depth.DepthEnable.as_bool()
+            && self.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
+    }
+
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
         D3D12_DEPTH_STENCIL_DESC1 {
