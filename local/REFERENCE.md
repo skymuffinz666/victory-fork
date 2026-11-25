@@ -585,3 +585,18 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   close-ups (`frame-1254.png`) and the prison window (`frame-1502/1902.png`)
   have clean faces and hair with no new artefact; the blue/white blocks along
   the bottom edge remain unchanged.
+- Full offline validation of all saved containers on the final build
+  (`translate --list --jobs 8 --validate --pipelines`, 5726 files, 385
+  duplicates): **2867/2867 programs translated**; VS/PS 1267 emitted, 1258
+  validated, 1267 pipelines; compute 1068 emitted, 1068 validated, 1060
+  pipelines; mesh 532 emitted, 527 validated, 532 pipelines. The 14
+  validation failures are all signature classes (5 PS input-signature, 5 VS
+  output-signature, 2 mesh output-size, 2 mesh interpolation mismatch), and
+  every one of those programs still gets a pipeline on the NVIDIA driver; the
+  only programs without pipelines are the 8 wave64 computes already known.
+  Two candidate fixes were tried and reverted because they did not earn their
+  place: DexNom's VS PSV0 interpolation pass left all four sampled VS
+  output-signature failures unchanged, and the proposed `mul_hi` rewrite has
+  no DXIL opcode to target (Microsoft's `DxilConstants.h` defines `IMul=41`
+  and `UMul=42` as the full 32×32→64 multiply, with no UMulHi/SMulHi binary
+  op), so the existing `zext`/`mul i64`/shift form is already correct.
