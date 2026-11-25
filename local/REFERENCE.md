@@ -641,3 +641,13 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   `2cc4c197ee29e291` (CS_Tiling_Generate_Opaque) to the same opt-in allowlist:
   offline it also widens one branch, lowers to wave 32, validates and creates
   a pipeline. In-game verification of the two-program set is pending.
+- `ldsflow2` result (two allowlisted programs, 1000 s): no device removal,
+  exception or `id=538`; refusals fell from 8 to **6**. Median fps 3.9 over
+  72 intervals against 4.1 in `ldsflow1`, but the scenes differ (the last
+  `ldsflow2` interval was 2.9 fps at 6931 draws against 4.1 fps at 4793
+  draws), so no speed claim is made. Diner close-up `frame-1250.png` and the
+  prison window `frame-1530/2202.png` show clean faces and no new artefact;
+  the blue/white boxes along the bottom edge are unchanged, so neither
+  program feeds that symptom. The gate stays opt-in: pipeline creation and
+  unchanged screenshots do not prove that both host halves observe each
+  other's LDS writes, which needs the GPU fixture with swept writer counts.
