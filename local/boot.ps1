@@ -1,6 +1,6 @@
 param([string]$tag = "base1", [int]$seconds = 300,
       [string]$keys = "3:Enter,8:Enter,13:Enter,18:Enter,23:Enter,30:Down,31:Down,32:Enter,38:Down,39:Enter,45:Enter,46:Down,47:Enter,48:Down,49:Enter",
-      [switch]$d3d12Debug, [switch]$speed)
+      [switch]$d3d12Debug, [switch]$speed, [switch]$dumpTargets)
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 $cap = "D:\AIProjects\GTA6PC\c_$tag"
@@ -8,7 +8,7 @@ if (-not (Test-Path $cap)) { New-Item -ItemType Directory -Path $cap | Out-Null 
 $env:VICTORY_CAPTURE = $cap
 $env:VICTORY_CAPTURE_MENUS = "1"
 $env:VICTORY_CAPTURE_WORLD = "1"
-$env:VICTORY_DUMP_TARGETS = "1"
+if ($dumpTargets) { $env:VICTORY_DUMP_TARGETS = "1" } else { Remove-Item Env:\VICTORY_DUMP_TARGETS -ErrorAction SilentlyContinue }
 $env:VICTORY_LOG = "info"
 $env:VICTORY_GAME_DIR = "D:\GTA6.Xbox.v1.0.2.1"
 $env:VICTORY_KEYS_HOLD_MS = "500"

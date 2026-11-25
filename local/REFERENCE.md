@@ -176,6 +176,15 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   semantics; taking either side alone would silently miscompile. No change landed.
 
 ### Intro visual baseline and texture-budget caveat
+- `nodump1` ran with intermediate target dumping disabled and produced 148
+  final-frame images and no intermediate target images. Its `frame-1246.png`
+  still shows the missing torso and room, like the earlier kitchen capture;
+  seven compute pipelines were refused and no unhandled exception or device
+  removal was logged. Later diagnostic intervals reported roughly 6.6–7.5 fps,
+  but differing scenes, capture schedules and cache conditions prevent a
+  controlled before/after renderer performance claim. Final-frame captures and
+  other diagnostics remained enabled. `local/boot.ps1 -dumpTargets` opts back
+  into intermediate dumps.
 - `c_blend1/frame-1245.png` and `frame-1253.png` show missing portions of a
   character and the room; `frame-1261.png` also shows visible block artifacts.
   Visible heads and zero mesh-PSO refusals did not establish a correct intro.
