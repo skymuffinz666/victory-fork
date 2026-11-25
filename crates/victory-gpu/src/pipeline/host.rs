@@ -19,6 +19,7 @@ use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
+#[derive(Clone)]
 pub(crate) struct GraphicsState {
     blend: D3D12_BLEND_DESC,
     sample_mask: u32,
@@ -277,6 +278,39 @@ const QUADS: i32 = 32;
 pub(crate) fn bounded_root_srvs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
+}
+
+/// The console lets a blend state name any render target; D3D12 refuses to
+/// blend where the format does not support it (an R8_UINT target, debug layer
+/// 676, refused a whole mesh pipeline with `0x80070057`). Keep the title's
+/// blend state for every slot the device says is blendable, and turn off only
+/// the bits it cannot use.
+fn host_blend(g: &GraphicsState, device: &ID3D12Device) -> D3D12_BLEND_DESC {
+    let mut blend = g.blend;
+    for i in 0..g.targets.NumRenderTargets.min(8) as usize {
+        let format = g.targets.RTFormats[i];
+        if format.0 == DXGI_FORMAT_UNKNOWN.0 {
+            continue;
+        }
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: a plain query into our own structure.
+        let asked = unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        if asked.is_ok() && support.Support1.0 & D3D12_FORMAT_SUPPORT1_BLENDABLE.0 == 0 {
+            blend.RenderTarget[i].BlendEnable = false.into();
+            blend.RenderTarget[i].LogicOpEnable = false.into();
+            tracing::info!(slot = i, format = format.0, "blending is not supported by this host render target; the host pipeline drops it");
+        }
+    }
+    blend
 }
 
 /// One stage of a host pipeline and where its bindings go.
@@ -559,6 +593,11 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
+        // Keep the title's state, but give the host only blending its render
+        // target formats support. The clone owns its input element names.
+        let mut host_state = g.clone();
+        host_state.blend = host_blend(g, &host.device);
+        let g = &host_state;
         let depth_bounds = if g.depth_bounds {
             if host.depth_bounds() {
                 true
