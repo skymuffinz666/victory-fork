@@ -58,6 +58,11 @@ fn build() -> &'static [u8; 32] {
                 // a translation cached without the clamp must not be served.
                 crate::descriptor::host::probe_view_limit();
                 bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+                append_wave_profile(
+                    &mut bytes,
+                    victory_shader::emit::host_max_wave(),
+                    std::env::var_os("VICTORY_WAVE_LOCAL").as_deref(),
+                );
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
                 // So are the switches that pick the form of a wave64 program:
@@ -69,11 +74,18 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
+                    "VICTORY_FIRST_HALF",
+                    "VICTORY_FIRSTLANE_OWN",
+                    "VICTORY_STRICT_JOINS",
+                    "VICTORY_MESH_OUTPUT_STRICT",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
                     if let Some(value) = std::env::var_os(name) {
+                        bytes.push(1);
                         bytes.extend_from_slice(value.as_encoded_bytes());
+                    } else {
+                        bytes.push(0);
                     }
                     bytes.push(0);
                 }
@@ -91,6 +103,19 @@ fn build() -> &'static [u8; 32] {
             }
         }
     })
+}
+
+/// The wave width and local-wave policy select different emitted programs.
+fn append_wave_profile(bytes: &mut Vec<u8>, max_wave: u32, local: Option<&std::ffi::OsStr>) {
+    bytes.extend_from_slice(&max_wave.to_le_bytes());
+    match local {
+        Some(value) => {
+            bytes.push(1);
+            bytes.extend_from_slice(value.as_encoded_bytes());
+        }
+        None => bytes.push(0),
+    }
+    bytes.push(0);
 }
 
 /// The translation of a console shader container, from the cache when
@@ -332,6 +357,46 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave_profiles_do_not_share_shader_cache_entries() {
+        let key = |width, local: Option<&str>| {
+            let mut bytes = b"same executable".to_vec();
+            append_wave_profile(&mut bytes, width, local.map(std::ffi::OsStr::new));
+            *blake3::hash(&bytes).as_bytes()
+        };
+        let profiles = [
+            key(0, None),
+            key(32, None),
+            key(64, None),
+            key(32, Some("0")),
+            key(32, Some("idiom")),
+            key(32, Some("")),
+        ];
+        for (i, a) in profiles.iter().enumerate() {
+            for b in &profiles[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        for profile in &profiles {
+            assert_eq!(
+                cached(&cache, profile, b"same shader", translate),
+                Ok(shader())
+            );
+            assert_eq!(
+                cached(&cache, profile, b"same shader", translate),
+                Ok(shader())
+            );
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), profiles.len() as u64);
+    }
 
     fn shader() -> HostShader {
         HostShader {

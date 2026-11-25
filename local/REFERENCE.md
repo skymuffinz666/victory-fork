@@ -187,3 +187,13 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
 - The debug-layer `blend1` log reports D3D12 CopyResource destination-state
   errors (id 538) later in the run. Their source and relation to the missing
   geometry or textures have not been established.
+- `intro_trace1` reproduced the defect in `frame-1247.png`: missing torso and
+  room geometry. `frame-1247-ops.txt` recorded four refused compute dispatches,
+  135 disabled BVH-builder dispatches, and no refused pixel shader in that
+  frame. `VICTORY_WALLS_TRACE=1` reported no failed storage reads in the run.
+  These observations do not identify which missing work caused the defect.
+- Shader-cache correctness fix: the cache key now includes the host maximum
+  wave width, `VICTORY_WAVE_LOCAL`, and other translation-affecting switches
+  previously absent. Cache tests exercise distinct wave widths and local
+  policies. This prevents inappropriate reuse across those configurations; it
+  has not been shown to repair the intro or improve performance.
