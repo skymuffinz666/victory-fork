@@ -558,3 +558,21 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   heavily overexposed (white hair, blown-out ATM/counter lights) with flat
   cutout reflections in the glass. `CS_CollisionRaytraced` had not been seen in
   earlier, shorter runs.
+- Translation-side GPU work (`cec8e0a` and the following uncommitted edits):
+  (1) mesh quad swizzles and within-quad DPP8 use single
+  `quadReadLaneAt.i32`/`quadOp.i32` instructions instead of four reads plus
+  three selects (the pixel path is unchanged unless `VICTORY_PIXEL_QUAD_HELPERS=1`);
+  (2) integer-format render targets drop `BlendEnable` before PSO creation;
+  (3) `first_lane` skips the `waveActiveBallot` and guarded lane read when the
+  guard is constant true (453 such ballots in the saved cache); (4)
+  translator-added barriers in an all-lane block are coalesced while no LDS
+  write or atomic has intervened, with the flag cleared at every block start
+  and every store/atomic, while region-boundary meetings stay unconditional.
+  Sampling the saved cache: the top barrier program `0a5d4f9047b3dce4` emits
+  **50** barriers instead of 128; `b8f3f7979d6bbc50` 418 instead of 419;
+  `eae3498e6553afa8` unchanged at 429. All three still validate with
+  `dxil.dll` and create pipelines. Unit suites unchanged (211 shader pass /
+  4 pre-existing BVH one-ULP failures, 139 GPU tests pass). The tally behind
+  these choices: 4,165 barriers in 208 programs, 1,476 pairs with only LDS
+  reads between and 205 back-to-back; 2,841,213 guarded `select i1` and
+  3,459 `mul_hi` products remain for later work.

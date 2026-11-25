@@ -187,6 +187,9 @@ struct Lower<'a> {
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
+    /// A translator-added barrier in `cur` with no LDS write or atomic since:
+    /// another meeting barrier there would fence the same values again.
+    meet_clean: Option<usize>,
     bools: HashMap<(usize, Bool), V>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
@@ -1522,6 +1525,7 @@ impl<'a> Lower<'a> {
             floats: HashMap::new(),
             block: vec![None; p.blocks.len()],
             cur: 0,
+            meet_clean: None,
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
@@ -2256,6 +2260,7 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            self.meet_clean = None;
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -4359,6 +4364,11 @@ impl<'a> Lower<'a> {
         let Some(g) = guard else {
             return (first, self.s.m.bool(true));
         };
+        if g == self.s.m.bool(true) {
+            // Every lane here runs: the first active lane is the wave's first
+            // lane, so the ballot and the guarded lane read add nothing.
+            return (first, self.s.m.bool(true));
+        }
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
         let r = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
         let (lo, hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
@@ -4838,6 +4848,17 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        // A later meeting need not fence again until some write or atomic has
+        // happened in this block.
+        if name.contains("store")
+            || name.contains("atomic")
+            || matches!(inst.fields, Fields::Ds { .. })
+                && !(name.starts_with("ds_read")
+                    || name.starts_with("ds_swizzle")
+                    || name.contains("permute"))
+        {
+            self.meet_clean = None;
+        }
         if self.split_lds
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
@@ -4845,9 +4866,12 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            if self.meet_clean != Some(self.cur) {
+                let mode = self.s.m.i32(meeting_mode());
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.meet_clean = Some(self.cur);
+            }
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
