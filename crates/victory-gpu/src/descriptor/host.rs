@@ -26,10 +26,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
-    /// A fingerprint of the record each slot held when the pass over
-    /// records copied in as bytes last looked at it
-    /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
-    copied: Mutex<Vec<u64>>,
+    /// The tag, view index and generation last seen by the pass over
+    /// records copied in as bytes. `None` means never looked at.
+    copied: Mutex<Vec<Option<[u32; 3]>>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -1796,8 +1795,9 @@ impl HostHeap {
 
     /// For a slot on a page of the title's heap that changed with no call
     /// (`super::sync_heaps`: the title copies records into its heap as
-    /// bytes): [`HostHeap::mirror`], if the `bytes` bytes of the record at
-    /// `handle` are not the ones this last saw there. True if it did.
+    /// bytes): mirror if the record's tag, index or generation changed.
+    /// Those are the only words [`HostHeap::mirror_record`] consumes.
+    /// True if it mirrored.
     ///
     /// The page says only that something on it was written, and `mirror`
     /// by itself would take every buffer or placed-texture record on it for
@@ -1818,24 +1818,23 @@ impl HostHeap {
         let [tag, i, generation] = std::array::from_fn(|n| {
             u32::from_le_bytes(words[n * 4..n * 4 + 4].try_into().unwrap())
         });
-        let n = record.len();
-        // Never 0, which is "never looked at".
-        let print = u64::from_le_bytes(blake3::hash(record).as_bytes()[..8].try_into().unwrap_or([1; 8])) | 1;
+        let key = [tag, i, generation];
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
+                copied.resize(self.count as usize, None);
             }
             let Some(last) = copied.get_mut(index as usize) else {
                 return false;
             };
-            // A slot never looked at that holds nothing: as it was.
-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
+            // Even a first-seen all-zero record must be mirrored: the slot
+            // might previously have been populated through a descriptor API.
+            if *last == Some(key) {
                 return false;
             }
-            *last = print;
+            *last = Some(key);
         }
-        self.mirror_record(index, handle, false, [tag, i, generation]);
+        self.mirror_record(index, handle, false, key);
         true
     }
 
@@ -1860,6 +1859,17 @@ impl HostHeap {
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        // A descriptor API or draw can mirror a newer record between heap
+        // sweeps. If the title later copies the old record back as bytes,
+        // the sweep must not mistake it for the host slot's current value.
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(last) = copied.get_mut(index as usize)
+                && last.is_some_and(|old| old != [tag, i, generation])
+            {
+                *last = None;
+            }
+        }
         self.mirror_record(index, handle, for_draw, [tag, i, generation])
     }
 

@@ -176,6 +176,17 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   semantics; taking either side alone would silently miscompile. No change landed.
 
 ### Intro visual baseline and texture-budget caveat
+- The `desccompare1` run was manually stopped in the prison scene. It used
+  exact tag/index/generation comparison in the copied-descriptor sweep in
+  place of a truncated BLAKE3 fingerprint, with no experimental pixel-quad
+  option. Seven compute pipelines were refused and ten shaders failed
+  translation; no unhandled exception or device removal was logged before
+  stopping. Its partial data and differing scene do not establish a speedup
+  or visual equivalence. Afterward, first-seen zero records were made to
+  clear previously populated host slots, and direct mirrors were made to
+  invalidate conflicting sweep records; these later edits only passed a
+  build check and have not run in the game. Exact records use more memory,
+  and invalidation takes the copied-record lock on direct mirrors.
 - `prologue1`, built from `94a8a0e`, ran for the timed 900 seconds and
   reached the prison scene (`frame-3512.png`). Later captures remain at nearly
   the same camera position; playable control or a wait for input has not been
