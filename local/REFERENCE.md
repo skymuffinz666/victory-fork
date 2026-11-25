@@ -140,8 +140,8 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   `1491.0/frame` are `a stage of the ray-tracing structure builder, which is off`
   (intentional), `9.0/frame` are pixel `6b6db9f1a526daeb` (descriptor read only as data),
   and 1/frame each for four refused wave64 compute hashes. So there is no large pool of
-  recoverable draws hiding behind that counter; do not optimise it further without a
-  different measurement.
+  additional missing-pipeline reasons in that particular report. This does **not**
+  establish that the disabled builder or refused shaders have no visual impact.
 
 ### Speed switch and descriptor-diagnostic probes (2026-11-25)
 - `VICTORY_D3D12_BACKGROUND=0` (`c_bg0_stderr.txt`) logged
@@ -174,3 +174,16 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   high-SGPR handling and back-edge `phi_joins`, so the conflicts are in core lowering
   logic, not tests. A union cannot be verified as correct without re-porting those
   semantics; taking either side alone would silently miscompile. No change landed.
+
+### Intro visual baseline and texture-budget caveat
+- `c_blend1/frame-1245.png` and `frame-1253.png` show missing portions of a
+  character and the room; `frame-1261.png` also shows visible block artifacts.
+  Visible heads and zero mesh-PSO refusals did not establish a correct intro.
+- The `tex384` and `tex512` experiments used different scenes and timings from
+  `merge1`; their texture upload rates and fps cannot establish a causal speed or
+  visual-quality improvement. The proposed 384 MB default was not retained;
+  the default remains 192 MB. A larger upload total does not demonstrate that
+  the textures needed by the visible scene arrived correctly.
+- The debug-layer `blend1` log reports D3D12 CopyResource destination-state
+  errors (id 538) later in the run. Their source and relation to the missing
+  geometry or textures have not been established.
