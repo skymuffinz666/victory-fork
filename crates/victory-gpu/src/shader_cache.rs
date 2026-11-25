@@ -39,12 +39,9 @@ pub(crate) fn counts() -> (u64, u64) {
 
 /// What identifies the translation, besides the container: the shader
 /// crate's fingerprint (its source, every switch it reads, the host facts the
-/// device gave it, the loop limit, barrier waits and clean-up passes) and
-/// this file's encoding of the result. Not the whole executable any more: a
-/// rebuild that leaves the translator alone keeps its translations (each new
-/// build used to translate the title's thousands of shaders again, which kept
-/// the first minutes of every test run short of pipelines).
-/// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
+/// device gave it, the loop limit, barrier waits and clean-up passes), the
+/// executable, and this file's encoding of the result. Hashing the executable
+/// also invalidates entries when translation-affecting dependencies change.
 /// Worked out per lookup, so a translation made before the device said its
 /// wave size is never filed under the later key.
 fn build() -> [u8; 32] {
@@ -53,25 +50,25 @@ fn build() -> [u8; 32] {
     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
         WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
     }
-    static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+    static EXE: OnceLock<[u8; 32]> = OnceLock::new();
     let exe = EXE.get_or_init(|| {
-        if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
-            match std::env::current_exe().and_then(std::fs::read) {
-                Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot read our executable; keying on the translator");
-                    None
-                }
+        match std::env::current_exe().and_then(std::fs::read) {
+            Ok(bytes) => *blake3::hash(&bytes).as_bytes(),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read our executable; shader cache is isolated to this run");
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let mut h = blake3::Hasher::new();
+                h.update(&now.as_nanos().to_le_bytes());
+                h.update(&std::process::id().to_le_bytes());
+                *h.finalize().as_bytes()
             }
-        } else {
-            None
         }
     });
     let mut h = blake3::Hasher::new();
     h.update(b"victory shader cache key 2\0");
-    if let Some(exe) = exe {
-        h.update(exe);
-    }
+    h.update(exe);
     crate::descriptor::host::probe_view_limit();
     h.update(&victory_shader::emit::translation_fingerprint());
     let mut wave = Vec::new();
