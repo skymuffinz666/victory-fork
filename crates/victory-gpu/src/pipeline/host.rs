@@ -218,6 +218,52 @@ impl GraphicsState {
             && self.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
     }
 
+    /// The guest colour buffer bypasses its blender for integer surfaces even
+    /// when a draw asks for blending; D3D12 validates blend enable against
+    /// every active target format when the pipeline is created.
+    pub(crate) fn apply_integer_blend_bypass(&mut self) {
+        let integer = |f: &DXGI_FORMAT| matches!(
+            *f,
+            DXGI_FORMAT_R32G32B32A32_UINT
+                | DXGI_FORMAT_R32G32B32A32_SINT
+                | DXGI_FORMAT_R32G32B32_UINT
+                | DXGI_FORMAT_R32G32B32_SINT
+                | DXGI_FORMAT_R16G16B16A16_UINT
+                | DXGI_FORMAT_R16G16B16A16_SINT
+                | DXGI_FORMAT_R32G32_UINT
+                | DXGI_FORMAT_R32G32_SINT
+                | DXGI_FORMAT_R10G10B10A2_UINT
+                | DXGI_FORMAT_R8G8B8A8_UINT
+                | DXGI_FORMAT_R8G8B8A8_SINT
+                | DXGI_FORMAT_R16G16_UINT
+                | DXGI_FORMAT_R16G16_SINT
+                | DXGI_FORMAT_R32_UINT
+                | DXGI_FORMAT_R32_SINT
+                | DXGI_FORMAT_R8G8_UINT
+                | DXGI_FORMAT_R8G8_SINT
+                | DXGI_FORMAT_R16_UINT
+                | DXGI_FORMAT_R16_SINT
+                | DXGI_FORMAT_R8_UINT
+                | DXGI_FORMAT_R8_SINT
+        );
+        let formats = &self.targets.RTFormats[..(self.targets.NumRenderTargets as usize).min(8)];
+        if !self.blend.IndependentBlendEnable.as_bool() {
+            let shared = self.blend.RenderTarget[0];
+            if !shared.BlendEnable.as_bool() || !formats.iter().any(integer) {
+                return;
+            }
+            // D3D12 reads slot zero for every target with shared blending;
+            // expand it before overriding the integer targets.
+            self.blend.RenderTarget[..formats.len()].fill(shared);
+            self.blend.IndependentBlendEnable = (formats.len() > 1).into();
+        }
+        for (format, target) in formats.iter().zip(&mut self.blend.RenderTarget) {
+            if integer(format) {
+                target.BlendEnable = false.into();
+            }
+        }
+    }
+
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
         D3D12_DEPTH_STENCIL_DESC1 {

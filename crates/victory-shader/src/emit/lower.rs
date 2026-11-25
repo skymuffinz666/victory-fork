@@ -4301,10 +4301,24 @@ impl<'a> Lower<'a> {
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// lane must be a constant. A whole-quad broadcast or exchange needs one
+    /// native quad operation rather than four reads and three selects.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        match pattern {
+            Some(0xe4) => return x,
+            Some(p @ (0x00 | 0x55 | 0xaa | 0xff)) => {
+                let lane = self.s.m.i32(u32::from(p & 3));
+                return self.s.op(c, "quadReadLaneAt.i32", Attr::NoUnwind, self.s.t.i32, 122, &[x, lane]);
+            }
+            Some(p @ (0xb1 | 0x4e | 0x1b)) => {
+                // The low two bits pick lane 0's partner: XOR 1, 2 or 3.
+                let direction = self.s.m.i8((p & 3) - 1);
+                return self.s.op(c, "quadOp.i32", Attr::NoUnwind, self.s.t.i32, 123, &[x, direction]);
+            }
+            _ => {}
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -4455,7 +4469,7 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let r = if mesh_quad || self.pixel_quad_helpers(quad) {
-                self.quad_pick(x, src)
+                self.quad_pick(x, src, (offset & 0x8000 != 0).then_some(offset as u8))
             } else {
                 self.read_lane(x, src)
             };
@@ -6691,7 +6705,12 @@ impl<'a> Lower<'a> {
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // DPP8 holds two quads: each destination must read within its own quad
+        // before a quad read can implement the operation.
+        let quad = match dpp {
+            Dpp::Row { ctrl, .. } => ctrl <= 0xFF,
+            Dpp::Lanes { sel, .. } => (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0),
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
@@ -6772,7 +6791,11 @@ impl<'a> Lower<'a> {
             }
         };
         let mut r = if mesh_quad || self.pixel_quad_helpers(quad) {
-            self.quad_pick(x, src)
+            let pattern = match dpp {
+                Dpp::Row { ctrl, .. } => Some(ctrl as u8),
+                Dpp::Lanes { .. } => None,
+            };
+            self.quad_pick(x, src, pattern)
         } else {
             self.read_lane(x, src)
         };

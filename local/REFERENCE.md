@@ -544,3 +544,17 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
 - Save/Continue returning to the prologue after the early robbery is **expected
   game behaviour**: the title cannot save until a later story point. It is not
   a translation-layer save bug and needs no investigation.
+- Verification of the four borrowed fixes (`borrow1`, 1000 s with target dumps):
+  final frames reached only 2191, so the late dumps were still in the prison
+  sequence and no robbery-scene target was captured. One translation failure
+  (`926c46bab3b86bd6`) and eight compute refusals (the seven plus
+  `caf96a3229145fa6` = `CS_CollisionRaytraced`, reached in this scene) remained;
+  no device removal, exception or `id=538` error. Median `sync_heaps` was
+  26.66 ms for 236 pages/48k mirrored slots, versus 22.26 ms for 209 pages/38k
+  in `atomic1`; the scenes and capture schedules differ, so this does not show
+  a regression or a gain. Median fps 3.9 with 7006 draws in the last logged
+  interval (dumps distort timing). The earlier `mirror2` run reached frame
+  4732 and the first robbery: `frame-4300/4500/4700.png` show the teller scene
+  heavily overexposed (white hair, blown-out ATM/counter lights) with flat
+  cutout reflections in the glass. `CS_CollisionRaytraced` had not been seen in
+  earlier, shorter runs.
