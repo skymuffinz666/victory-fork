@@ -16,6 +16,9 @@ cargo +stable build --profile diag -p victory --features diagnostics
 - `c_head_debug.ps1` — the same navigation with `VICTORY_D3D12_DEBUG=1`, used to investigate the
   mesh pipeline refused with `0x80070057` and the missing character geometry.
 - `parse_head.py` — summarises the D3D12 debug messages in `c_head_stderr.txt`.
+- `backup.ps1` — rebuilds `D:\AIProjects\GTA6PC\_backup\VICTORY-5080-boot-5080.bundle`
+  from every local branch. A local `.git/hooks/post-commit` hook calls it after each commit,
+  so the on-disk backup always matches `HEAD`. Push still has to be done with `git push`.
 
 Input-driver additions in `gameinput.rs` (diagnostics builds only):
 
