@@ -541,3 +541,6 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   139 victory-gpu tests pass; the shader suite remains 211 pass / 4 pre-existing
   one-ULP BVH failures. In-game verification of these four is pending (the
   `mirror2` dump run used the previous binary).
+- Save/Continue returning to the prologue after the early robbery is **expected
+  game behaviour**: the title cannot save until a later story point. It is not
+  a translation-layer save bug and needs no investigation.
