@@ -89,5 +89,20 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   `frame-1143.png` (close-up, face partly cropped), `frame-1191.png` (character **with** a
   complete head and face) and `frame-1151/1159/1167/1183.png` (credits cards). So the
   missing head is scene/model-specific, not universal.
-- Next measured step: identify whether the dropped PSO is used by the driver model in
-  `frame-1135.png` before changing any depth state.
+### Measured root cause and fix for the missing heads (2026-11-25)
+- The depth-state hypothesis was **disproved**: with `VICTORY_D3D12_DEBUG=1` the state at refusal
+  had `DepthEnable=BOOL(0)` and `DSVFormat=0`, so depth was not the cause.
+- The debug layer named the cause: `CreateGraphicsPipelineState: The render target format at
+  slot 2 is format (R8_UINT). This format does not support blending ... id=676`, plus
+  `SV_Target2 has type that is NOT float, while ... blending enabled`. The title's blend state
+  enables blending on an integer render target; D3D12 rejects the whole PSO with `0x80070057`.
+- Fix (commit `db11ad4`): query `D3D12_FORMAT_SUPPORT1_BLENDABLE` per render target and disable
+  only the blend bits on slots the device cannot blend. Title state is otherwise unchanged.
+- Verified run `c_blend1_stderr.txt` / `c_blend1` (300 s, speed switches, debug layer):
+  `host mesh pipeline refused` **0** (was 1), `id=676` **0**, `f5e50eb2108c425b` bound at
+  frame 1044, no exceptions, world at frame 1021. Dropped draws/frame fell from 380–626 to
+  147–394. Contact sheets: `base1` frames 1083/1103/1119/1135 show black heads;
+  `blend1` frames 1061/1085/1093/1141/1149/1157 show visible faces and hair.
+- Still open: compute pipelines refused for wave64 on a 32-lane device
+  (`02384a60fda6f2d0`, `2cc4c197ee29e291`, `2da4beb386509b77`, `369cbe906ea72764`);
+  some backlit scenes in `blend1` (1245/1253/1261) still show dark silhouettes.
