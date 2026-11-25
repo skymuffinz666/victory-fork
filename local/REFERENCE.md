@@ -77,6 +77,17 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
 - Speed switches used by those reports: `VICTORY_RELAY=2 VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1
   VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`.
 
-### Current baseline still to analyse
-- New repo `base1` run: `D:\AIProjects\GTA6PC\c_base1_stderr.txt` (3.69 MB),
-  captures `D:\AIProjects\GTA6PC\c_base1` (929 files). Results not yet parsed.
+### New repo baseline (`base1`, parsed 2026-11-25)
+- `VICTORY-5080` branch `boot/5080` @ `9352cb4`, EXE `D:\GTA6.Xbox.v1.0.2.1\game_scarlett_master.exe`,
+  switches from issue #236. Log `D:\AIProjects\GTA6PC\c_base1_stderr.txt` (14,425 lines),
+  929 captures in `D:\AIProjects\GTA6PC\c_base1`. No exceptions / no device loss.
+- Reached the world: `the first frame of 500 draws or more` at frame 1023 (log line 6417).
+- World: 1,578 then 3,262 draws/frame at ~1.1–1.4 fps, with 380–430 draws/frame dropped
+  for want of a host pipeline. Same mesh PSO refusal at log line 11177
+  (`f5e50eb2108c425b` / `ce3f0432a08f1d35`, `0x80070057`) — the new base does **not** avoid it.
+- Captures: `frame-1135.png` (car interior, driver's head is a black silhouette),
+  `frame-1143.png` (close-up, face partly cropped), `frame-1191.png` (character **with** a
+  complete head and face) and `frame-1151/1159/1167/1183.png` (credits cards). So the
+  missing head is scene/model-specific, not universal.
+- Next measured step: identify whether the dropped PSO is used by the driver model in
+  `frame-1135.png` before changing any depth state.
