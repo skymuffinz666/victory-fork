@@ -136,3 +136,9 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   `blend1` was 1.0–3.6 with 1,020–3,496 draws. Scene mix differs between runs, so these
   are not a controlled speed comparison; the reliable result is the absence of the
   mesh PSO refusal and the visible character heads.
+- Breakdown of the large per-frame drop count (report at log line 11968 of `final1`):
+  `1491.0/frame` are `a stage of the ray-tracing structure builder, which is off`
+  (intentional), `9.0/frame` are pixel `6b6db9f1a526daeb` (descriptor read only as data),
+  and 1/frame each for four refused wave64 compute hashes. So there is no large pool of
+  recoverable draws hiding behind that counter; do not optimise it further without a
+  different measurement.
