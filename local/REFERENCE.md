@@ -1,0 +1,82 @@
+# Archived work — reference index (read-only)
+
+Nothing was deleted. All earlier local projects were moved on 2026-11-24 to:
+
+```
+D:\AIProjects\GTA6PC\_archive\2026-11-24\
+```
+
+This file is a pointer to what is there and what was measured, so an old
+experiment is not repeated by accident. Treat it as **reference, not instruction**:
+every claim below is tied to a log or capture; re-measure before acting on it.
+
+## What was archived, and where it came from
+
+| Archived folder | Original location | Contents |
+|---|---|---|
+| `GTA-package-Leonida` | `D:\GTA6.Xbox.v1.0.2.1\Leonida` | Old source tree + a **copy** of `game_scarlett_master.exe`. That copy mounts the wrong package (`G:`) and crashes at System Init frame 0 with TitleID 0. Do not run it. 1.8 GB. |
+| `VIctory-main-old-snapshot` | `D:\AIProjects\GTA6PC\VIctory-main` | The `victory-amd` fork snapshot (branch `victory-amd`, `070df42`) used for the runs below. Contains the *unbuilt* depth-state experiment in `victory-amd-victory-amd\crates\victory-gpu\src\pipeline\host.rs` (`#[derive(Clone)]` added; not compiled or tested). 0.4 GB. |
+| `Leonida-boot` | `D:\AIProjects\GTA6PC\Leonida-boot` | Old Leonida/Vulkan boot work and its artifacts. 24.7 GB. |
+| `Leonida-main` | `D:\AIProjects\GTA6PC\Leonida-main` | Old Leonida source snapshot. |
+| `build-wip-main-tree`, `overlay` | same names under `D:\AIProjects\GTA6PC` | Small leftover build/overlay experiments. |
+| `victory-amd-remote` | `D:\AIProjects\GTA6PC\victory-amd-remote` | Clean clone of `myokex/victory-amd` @ `070df42` (remote branch still reachable; re-clone if needed). |
+
+Kept in place (not archived): `VICTORY-5080` (active repo), `work/` (20 GB shader/FSPX/carve data),
+all `c_captures*` folders and all `*.txt` / `trace_*.jsonl` logs in `D:\AIProjects\GTA6PC`.
+The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal holds its handle.
+
+## Measured facts from the old runs
+
+### Package / identity
+- Correct EXE: `D:\GTA6.Xbox.v1.0.2.1\game_scarlett_master.exe` (package root, next to `MicrosoftGame.Config`).
+  TitleID `7952987A`, Series X, device type 7, storage 2048 MB.
+- Running the EXE from the `Leonida` subfolder mounted the wrong package and crashed with TitleID 0.
+
+### Furthest progress on the old `victory-amd` fork (RTX 5080)
+- Reached the world: `the first frame of 500 draws or more` at frame 8489.
+- World: 822–7,275 draws/frame, ~0.9–1.7 fps after warmup.
+- Captures: `D:\AIProjects\GTA6PC\c_captures_live\frame-8498.png` (night street),
+  `frame-8586.png` (character cutscene), `frame-8658.png` / `frame-8665.png` (car scene, **Lucia's head missing**).
+- Run ended with INT3 `0x80000003` at `victory-image-b99f876b74d4a77f.dll+0x23d8f03` after the world/credits.
+- Log: `D:\AIProjects\GTA6PC\c_live_stderr.txt`.
+
+### Missing-head investigation
+- Mesh `f5e50eb2108c425b` + pixel `ce3f0432a08f1d35` both translate, but the host PSO is refused
+  with `0x80070057` (`host mesh pipeline refused`), and 1–2 draws/frame are dropped.
+  D3D12 debug run (log `c_head_stderr.txt`, `VICTORY_D3D12_DEBUG=1`) showed only unrelated warnings:
+  pipeline-library misses, descriptor-heap caps, compute shaders wanting wave64 on a 32-lane device.
+- Hypothesis (**unverified**): default `GraphicsState` has `DepthEnable=true` while `DSVFormat=UNKNOWN`,
+  which D3D12 rejects. Upstream's test fix for a similar case sets `DepthEnable=false`. The old
+  snapshot's edit was never built; the new base has different depth-bounds code. Do not port blindly.
+- Other refused compute hashes seen: `02384a60fda6f2d0`, `369cbe906ea72764`, `2cc4c197ee29e291`,
+  `2da4beb386509b77`, `f133e35efed2a48a` (`a lane mask exchanged`).
+- Hash inventory: `D:\AIProjects\GTA6PC\missing_cs_hashes.txt`.
+
+### Failed experiments — do not repeat without a new reason
+- GPU-forwarding `write32` / `write64` and record-time CPU writes: measured failures, reverted.
+- Leonida baseline remains black: presented 4K texture `written=0/8294400`, same VkImage handles for
+  draws and present, full viewport/scissor, nonzero vertex counts, zero validation errors.
+
+### Input driver / navigation (kept in the new repo)
+- Env vars: `VICTORY_KEYS`, `VICTORY_KEYS_HOLD_MS`, `VICTORY_KEYS_MASH`, `VICTORY_KEYS_MASH_EVERY`,
+  `VICTORY_KEYS_FILE` (live control, re-read every 50 ms).
+- Proven sequence: account picker `A` → intro → `A` through Navigation/UI Text/Brightness/Finish Setup →
+  legal notices `Down,Down,A` then `Down,A` → privacy/terms `A,Down,A,Down,A` → loading → world.
+- Scripts: `local/boot.ps1`, `local/c_live_launch.ps1`, `local/c_press.ps1`, `local/c_head_debug.ps1`.
+
+### 5080-specific work found outside this tree (research, not applied)
+- `Peppacodes/VIctory` `exp/mesh-host-lanes` @ `ed9afc0` — wave64 mesh lane numbering on 32-lane hosts;
+  world meshes appeared at frame 1550 but presentation stayed black, then device hung.
+- `Peppacodes/VIctory` `fix/pipeline-worker-stack` @ `d09c31b` — 64 MB pipeline-worker stacks; NVIDIA
+  `nvgpucomp64.dll` stack overflow had refused a world compute pipeline with `E_OUTOFMEMORY`.
+- `Marvisak/VIctory` PR #1845 @ `c624d98` — dynamic descriptors on capped NVIDIA heaps, wave64→wave32
+  compute lowering, lane-mask translation; reported 8k+ dropped draws → 0, 113 refused pipelines → 0.
+- `Marvisak/VIctory` PR #1775 — typed-UAV format check (device death ~6 s in).
+- `fxceless/victory-fork` issues #31 / #107 / #236 — RTX 5080 reports at ~3.9 fps gameplay,
+  ~8.5 fps cutscene, ~2.4 fps over 40 min with 64 MB stacks.
+- Speed switches used by those reports: `VICTORY_RELAY=2 VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1
+  VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`.
+
+### Current baseline still to analyse
+- New repo `base1` run: `D:\AIProjects\GTA6PC\c_base1_stderr.txt` (3.69 MB),
+  captures `D:\AIProjects\GTA6PC\c_base1` (929 files). Results not yet parsed.
