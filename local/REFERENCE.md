@@ -371,3 +371,18 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   executed in this probe. Wave-wide lowering is unsafe to enable globally:
   earlier runs lost the device on different shaders with barriers in divergent
   control flow. Pipeline creation is not proof of correct or safe execution.
+- Diner scene in `translated1` (`frame-1411.png`, all experimental overrides
+  off): the standing character's face is black with multicolour noise specks,
+  its shirt shows fine speckled noise, and blue/white blocks appear along the
+  bottom edge; the room is much darker than the console's. The seated
+  character's head in the same frame renders with plausible skin and hair. The
+  same log reports 8441 textures passed over unmapped and 356 draws/frame
+  dropped without a host pipeline, while `CS_Visibility`,
+  `CS_Tiling_Generate_Opaque` and the tiled-transmission programs were refused.
+  This localises the symptom to texture data that never reached the host and
+  to dropped tiled-lighting work, but does not establish which mechanism causes
+  the face's colours. Neighbouring frames show the scene itself:
+  `frame-1475.png` (prison window) has the same block artifacts in its lower
+  corners. The loading-screen art frames (`frame-480/832/1184/1264/1344.png`)
+  render with clean geometry and full-colour textures, so the defect is not in
+  the plain-textured draws that carry those screens.
