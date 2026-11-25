@@ -576,3 +576,12 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   these choices: 4,165 barriers in 208 programs, 1,476 pairs with only LDS
   reads between and 205 back-to-back; 2,841,213 guarded `select i1` and
   3,459 `mul_hi` products remain for later work.
+- In-game verification of the translation-side changes (`optcheck1`, 450 s,
+  no dumps, no overrides): one translation failure and the same eight compute
+  refusals, no device removal, unhandled exception or `id=538` error. Median
+  fps 4.4 over 78 intervals; the last logged frame was 5.3 fps with 67.4 ms
+  on the GPU and 4772 draws, against 5.3/88.1 ms/7006 draws in `borrow1` —
+  different scenes and durations, so **no fps gain is claimed**. Diner
+  close-ups (`frame-1254.png`) and the prison window (`frame-1502/1902.png`)
+  have clean faces and hair with no new artefact; the blue/white blocks along
+  the bottom edge remain unchanged.
