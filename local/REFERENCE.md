@@ -600,3 +600,24 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   no DXIL opcode to target (Microsoft's `DxilConstants.h` defines `IMul=41`
   and `UMul=42` as the full 32×32→64 multiply, with no UMulHi/SMulHi binary
   op), so the existing `zext`/`mul i64`/shift form is already correct.
+- Feasibility verdict for the refused wave64 computes (Hy4 design review against
+  XCL's wave64-on-wave32 doc and Marvisak #1132): the only missing primitive is
+  a **sound intra-region LDS ordering point that both host halves reach**;
+  thread remapping, exchange slots and predicated LDS writes already exist here
+  (`lower.rs:3680-3808`, `structure.rs:473-480`, `lower.rs:4652-4673`). The
+  earlier digest-gated widening produced pipelines but wrong pixels because it
+  set `wave=32` *without* `split_lds`, so neither the per-access barriers
+  (`lower.rs:4862-4875`) nor the region meetings (`lower.rs:2288-2305`) fired;
+  the two halves raced on the same LDS dwords. Of the refused programs, only
+  `369cbe906ea72764` (CS_Visibility) and `2cc4c197ee29e291`
+  (CS_Tiling_Generate_Opaque) use constant LDS dwords with write→read in one
+  region; `5dc…`/`6f…` additionally need readlane exchange and 4/7 widened
+  branches, `caf96a3229145fa6` uses computed addresses and `ds_wrxchg_rtn`
+  (read+write by definition), the 128/256/1024-thread programs need
+  double-buffered exchange slots and arrival counters that this tree lacks,
+  and `926c46bab3b86bd6` needs both the LDS region and the `Lane`/`Opaque`
+  loop-carried mask phi solved. A sound landing would have to be a narrow,
+  opt-in lowering with fixtures that prove both halves see the write (sweep
+  1/31/32/33/64 writers), must keep `VICTORY_GROUP_SYNC=2` and the approximate
+  local fallback off, and must be aborted on any device loss or slower
+  submissions. No code was changed from this review.
