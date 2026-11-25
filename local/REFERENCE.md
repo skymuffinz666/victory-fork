@@ -386,3 +386,50 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   corners. The loading-screen art frames (`frame-480/832/1184/1264/1344.png`)
   render with clean geometry and full-colour textures, so the defect is not in
   the plain-textured draws that carry those screens.
+- Frame-time accounting read against the code (Hy4 investigation, no code
+  changed): the printed `88.9 preparing` is `SUBMISSION_US[0]` (`host.rs:342`),
+  `copies 46.0 ms` is `PREPARING[0]/[1]` from `Step::Copy`/`Step::Fill` in
+  `run_deferred` (`host.rs:5204-5224`), `textures 14.0 ms` is `Staging::refresh`
+  (`texture.rs:898`), `85.0 on the GPU` is `SUBMISSION_US[1]`, and `141.0
+  copying back` is the relay path (`relay_land` `host.rs:3472`,
+  `relay_card_back` `host.rs:3349`). The readback is **not** per-resource
+  `Map`/memcpy: one command list with one `CopyBufferRegion` per flagged piece
+  into a persistently mapped buffer, then one synchronous fence wait per
+  landing; the log attributes 104–133 ms/frame to those fetch waits (7–12
+  landings/frame) and 33–47 ms to idle-card waiting, so the relay's cost is
+  fence serialization, not staging. `heap buffers 120.0 ms` is `draw.rs:1399-1550`
+  **including** `heap_textures` at `draw.rs:1532`: buffer refresh and texture
+  staging share one timer and are not split yet. `descriptor::sync_heaps`
+  (`descriptor.rs:172`, once per submission, one kernel read per 4 KiB page,
+  ~221 pages and ~43k mirrored slots) runs before the `preparing` timer starts
+  at `host.rs:4020`, so its 24–33 ms/frame is unattributed in the frame line.
+  Card limits (`shadow.rs:154-158`: 1 MiB/1024 MB) already equal `boot.ps1`'s
+  `-speed` values, so those two settings are no-ops. Many paths Hy4 checked are
+  already default-on (`VICTORY_HEAP_SYNC`, `VICTORY_VIEW_INLINE`,
+  `VICTORY_ASK_ONCE`, `VICTORY_WIDE_BACK`, `VICTORY_CARD_BUFFERS`, relay stage
+  2), and `VICTORY_WIDE_MERGE` does not apply while the relay is on.
+- Upstream reconciliation (Hy4 review of fetched refs; nothing merged): all
+  eleven upstream SHAs resolve in this repository. The upstream perf chain is
+  `9376fd6` → `f85101b` → `a253706` → `0b0074e` → `3973179` → `465b94f` →
+  `ca8829f` → `d510ee4` (merge base with our line is `a26859f`), and PR #1845 is
+  a separate chain `4db3b01` → `3014591` → `e716e31` → `351e728` → `c624d98`.
+  None of the eight perf commits re-enables `VICTORY_INDIRECT_WINDOW`,
+  `VICTORY_WAVE_WIDE`, `VICTORY_PIXEL_QUAD_HELPERS` or `VICTORY_RAW_SRV_OWN_COPY`,
+  and none mentions the two removed descriptor assumptions or an AMD constant-light
+  substitute; upstream keeps `VICTORY_INDIRECT_WINDOW` opt-in and adds a driver
+  watch gate to it. Conflicts that block a straight port: `9376fd6` and
+  `a253706` rewrite `descriptor/host.rs::mirror_copied`/`mirror_copied_page` onto
+  a multiply-fold record fingerprint (`record_print`) and default to *skipping*
+  mirror work for slots read through tables lately, which loses our exact
+  `[tag, index, generation]` tracking and first-seen-zero clearing; `a253706`
+  reintroduces a `rehash_runs()` gate on the card rehash while our `host.rs:3183`
+  is deliberately always joined. PR #1845's `c624d98` additionally replaces the
+  fork's `translate_for_wave`-free `shader_cache.rs:47-82` with
+  `translate_for_wave(c, max_wave)`, which on a 32-wave device makes the
+  wave-wide lowering unconditional, i.e. it defeats our `emit/mod.rs:428` gate.
+  Therefore the only upstream items safe without re-deriving our semantics are
+  `d510ee4` (README), `ca8829f` (fps overlay plus off-by-default
+  `VICTORY_COPY_CHANGED`), `465b94f` (off-by-default `VICTORY_INDIRECT_GATHER`),
+  then `0b0074e` and `3973179` (thread affinity, meters, off-by-default
+  `VICTORY_JOIN_PARTS`/`VICTORY_BACK_OWN_VIEW`) once the chain is reconciled.
+  `f85101b` needs its default-on `VICTORY_FILL_WAIT` reviewed before adoption.
