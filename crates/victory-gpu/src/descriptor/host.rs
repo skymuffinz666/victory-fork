@@ -1812,6 +1812,12 @@ impl HostHeap {
         if index >= self.count {
             return false;
         }
+        let Some(words) = record.get(..12) else {
+            return false;
+        };
+        let [tag, i, generation] = std::array::from_fn(|n| {
+            u32::from_le_bytes(words[n * 4..n * 4 + 4].try_into().unwrap())
+        });
         let n = record.len();
         // Never 0, which is "never looked at".
         let print = u64::from_le_bytes(blake3::hash(record).as_bytes()[..8].try_into().unwrap_or([1; 8])) | 1;
@@ -1829,7 +1835,7 @@ impl HostHeap {
             }
             *last = print;
         }
-        self.mirror(index, handle, false);
+        self.mirror_record(index, handle, false, [tag, i, generation]);
         true
     }
 
@@ -1854,6 +1860,13 @@ impl HostHeap {
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.mirror_record(index, handle, for_draw, [tag, i, generation])
+    }
+
+    /// Mirrors the already-read record while retaining its title handle for
+    /// deferred texture bookkeeping. In particular, the heap sweep uses its
+    /// kernel-read snapshot rather than dereferencing a possibly unmapped page.
+    fn mirror_record(&self, index: u32, handle: u64, for_draw: bool, [tag, i, generation]: [u32; 3]) -> Option<View> {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());

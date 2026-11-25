@@ -176,6 +176,15 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   semantics; taking either side alone would silently miscompile. No change landed.
 
 ### Intro visual baseline and texture-budget caveat
+- `prologue1`, built from `94a8a0e`, ran for the timed 900 seconds and
+  reached the prison scene (`frame-3512.png`). Later captures remain at nearly
+  the same camera position; playable control or a wait for input has not been
+  established. The frame still has visible block artifacts. The last three
+  reported intervals were approximately 4.2 fps; seven compute pipelines were
+  refused, ten shaders failed translation, and no unhandled exception or
+  device removal was logged. The timed runner stopped the process; it did not
+  exit naturally. The descriptor snapshot edit made during the run was not in
+  the running binary.
 - `upstreamroom1` booted integration commit `7369f49` with normal scissors,
   experimental wave-wide lowering off, and the guessed 2D descriptor fallback
   off. `frame-1412.png` shows the room wall and both characters' torsos,
