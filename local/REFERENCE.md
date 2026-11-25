@@ -176,6 +176,19 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   semantics; taking either side alone would silently miscompile. No change landed.
 
 ### Intro visual baseline and texture-budget caveat
+- `upstreamroom1` booted integration commit `7369f49` with normal scissors,
+  experimental wave-wide lowering off, and the guessed 2D descriptor fallback
+  off. `frame-1412.png` shows the room wall and both characters' torsos,
+  unlike the earlier missing-room/torso captures. `frame-1372.png` still has
+  substantial block artifacts. Seven compute pipelines were refused and
+  eight shaders failed translation; no unhandled exception or device removal
+  was logged. The game was stopped by the timed runner, not a natural exit.
+  Later diagnostic intervals reported 1.3–5.1 fps; they are not a controlled
+  performance comparison. Descriptor-sync logs report copied heap records
+  being mirrored, but this multi-change integration does not establish which
+  change caused the visual improvement. Full correctness and 30 fps remain
+  unverified. The subsequent executable-hash cache-key edit was not in this
+  run's binary.
 - Seven refused compute shaders were independently tested offline with a
   32-lane host limit. All seven validate as DXIL but their default output
   requests wave64, which the RTX 5080 cannot create. With experimental
