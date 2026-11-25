@@ -154,3 +154,16 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   (`Value(8184)`–`Value(9225)`), `lane_copied=false`. The translator refuses them as
   `a descriptor read only as data` (6 failures in that run). Supporting them would need
   a host-side descriptor representation, not a flag; not attempted.
+
+### Upstream PR #1845 — prefix reuse of fresh descriptor tables (merged)
+- Cherry-picking `e716e31` as a whole conflicts with our newer null-slot view-heap
+  capping (`probe_view_limit`) and hash-keyed `fresh_tables`. Only its self-contained
+  part was ported: `draw.rs` now keeps `FreshTables`, matching copied `[u32; 3]`
+  descriptor records by exact prefix, so stages/draws binding a shorter unchanged
+  prefix share the same dynamic slots. The capped-heap split part was **not** taken;
+  our heap handling is different and already avoids the 65k-slot fallback.
+- `cargo test -p victory-gpu --lib fresh_tables` passes (unit test from the commit).
+- Verified boot `c_merge1_stderr.txt` (300 s, speed switches): world at frame 1023,
+  `host mesh pipeline refused` **0**, no exceptions, dynamic tables asked per report
+  median ~5,193 (was ~7,590 in `final1`) with 0 refused. Scene mix differs, so this
+  is indicative rather than a controlled speed result; no regression was measured.
