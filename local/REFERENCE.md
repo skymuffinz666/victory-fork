@@ -10,6 +10,9 @@ This file is a pointer to what is there and what was measured, so an old
 experiment is not repeated by accident. Treat it as **reference, not instruction**:
 every claim below is tied to a log or capture; re-measure before acting on it.
 
+Branches: `boot/5080` is the verified baseline (blend fix, reference index). Ongoing
+work happens on `next/5080`, branched from it, so the known-good state is not disturbed.
+
 ## What was archived, and where it came from
 
 | Archived folder | Original location | Contents |
@@ -123,3 +126,13 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   deliberate merge of both implementations.
 - The 64 MB pipeline-worker stack fix (`Peppacodes` `d09c31b`) addresses `E_OUTOFMEMORY` on a
   different 5080 pipeline; our refusals are `E_INVALIDARG` from wave size, so it does not apply.
+
+### Clean verification without the debug layer (`final1`, 2026-11-25)
+- `c_final1_stderr.txt` (12,281 lines), 651 captures. Same switches, no `VICTORY_D3D12_DEBUG`.
+- World at frame 978; `host mesh pipeline refused` **0**, `id=676` **0**, no exceptions.
+- `dropped .../frame without a host pipeline: refused` summaries fell from 29 entries per
+  compute hash in `base1` to 12–13 in `final1`; the mesh PSO entry (8 in `base1`) is gone.
+- fps in the late world was 0.8–2.0 with 3,965–5,000 draws/frame; the debug-layer run
+  `blend1` was 1.0–3.6 with 1,020–3,496 draws. Scene mix differs between runs, so these
+  are not a controlled speed comparison; the reliable result is the absence of the
+  mesh PSO refusal and the visible character heads.
