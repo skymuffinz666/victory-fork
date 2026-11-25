@@ -197,3 +197,18 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   previously absent. Cache tests exercise distinct wave widths and local
   policies. This prevents inappropriate reuse across those configurations; it
   has not been shown to repair the intro or improve performance.
+- Fresh-translation boot `cachefix1`: reached the intro without a logged
+  unhandled exception or device removal, but `frame-1367.png` still shows the
+  missing torso and room. The same seven compute pipelines were refused.
+  Console containers are saved locally in `work/intro_shadercache_1` (do not
+  commit game data). Names embedded in four refused containers identify them as
+  `CS_DefragHeap_ComputeRelocations` (`02384a60fda6f2d0`), `CS_Visibility`
+  (`369cbe906ea72764`), `CS_Tiling_Generate_Opaque` (`2cc4c197ee29e291`) and
+  `CS_AlphTransmissionPrefilterMip` (`2da4beb386509b77`). Names alone do not
+  prove their relation to the visible defects.
+- Offline, with host wave limit 32 and `VICTORY_WAVE_WIDE=1`, the visibility
+  and opaque-tiling shaders emitted wave32 DXIL that validated and produced
+  host pipelines; the other two still failed pipeline creation. No shader was
+  executed in this probe. Wave-wide lowering is unsafe to enable globally:
+  earlier runs lost the device on different shaders with barriers in divergent
+  control flow. Pipeline creation is not proof of correct or safe execution.
