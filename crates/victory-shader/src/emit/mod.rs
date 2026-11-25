@@ -179,10 +179,18 @@ pub fn group_sync() -> u8 {
 pub(crate) fn lds_flow(c: &Container) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_FLOW").is_some_and(|v| v == "1"))
-        && c.digest
-            == [
+        && [
+            // CS_Visibility: constant dwords, one widened branch.
+            [
                 0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c,
-            ]
+            ],
+            // CS_Tiling_Generate_Opaque: constant dwords, one widened branch;
+            // its mask-as-data and `v_mbcnt` already use the exchange slots.
+            [
+                0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1,
+            ],
+        ]
+        .contains(&c.digest)
 }
 
 /// The clean-up passes that run over a translated program before it is

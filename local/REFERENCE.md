@@ -632,3 +632,12 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   suites are unchanged. The gate is in the translation cache key. An in-game
   run (`ldsflow1`, 1000 s) is running to check for device loss, slow
   submissions and any new image artefact; this is NOT yet a default fix.
+- `ldsflow1` result: no device removal, exception or `id=538`; refusals fell
+  from 8 to **7** (CS_Visibility now creates a pipeline). Median fps 4.1,
+  last logged frame 4.1 fps with 118.3 ms on the GPU. The blue/white pixel
+  boxes along the bottom edge are still present (`frame-1248/1504/1856.png`)
+  and match the same artefacts in earlier runs without the gate, so they are
+  not caused by the visibility program. Tier 2 adds
+  `2cc4c197ee29e291` (CS_Tiling_Generate_Opaque) to the same opt-in allowlist:
+  offline it also widens one branch, lowers to wave 32, validates and creates
+  a pipeline. In-game verification of the two-program set is pending.
