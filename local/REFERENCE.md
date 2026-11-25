@@ -187,6 +187,15 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   path was executed in that probe; no console-equivalence or causal relation
   to the visual defect is established. Strict refusal avoids that approximate
   fallback but also drops work; it is not full translation or a visual fix.
+- Hy4's offline review reproduced all six `cachefix1` pixel translation
+  failures on the saved containers with `VICTORY_DESC_WHY=1`. Their scalar
+  descriptor loads are used as data but cannot be matched by the current
+  `descriptor_data` view-kind lookup to an image instruction or equal-address
+  load. Disassembly shows bit extraction consistent with dimension fields;
+  the reported failure offset is a later consumer. The different dynamic
+  indices and the view's dimension, binding, and base-mip semantics must be
+  established before reconstructing those fields. No changes or claims of
+  visual repair follow from translation or pipeline creation alone.
 - In `intro_trace1` frame 1247 the missing torso and room also appear as
   black regions in the captured albedo-like intermediate target
   `frame-1247-13-0xfc739a6d40-2560x1440-f27.png`. This places the symptom
@@ -197,6 +206,13 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   widens title scissors globally. It changes intended rendering and can
   affect other passes, so it is not a fix and its result is not conclusive
   on its own. Compare the matching scene and intermediate targets.
+- `scissorfull1` tested that global override: `frame-1276.png` shows a
+  wall-like surface in the kitchen scene, but the torso is still missing and
+  severe block and line artifacts are visible; `frame-1316.png` also shows
+  missing torso and room. Seven compute pipelines were refused, with no
+  logged unhandled exception or device removal. Globally widened scissors
+  alter unrelated passes and this is not evidence of a correct wall or a
+  scissor implementation defect. The override remains off by default.
 - `nodump1` ran with intermediate target dumping disabled and produced 148
   final-frame images and no intermediate target images. Its `frame-1246.png`
   still shows the missing torso and room, like the earlier kitchen capture;
