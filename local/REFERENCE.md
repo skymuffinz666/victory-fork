@@ -176,6 +176,15 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   semantics; taking either side alone would silently miscompile. No change landed.
 
 ### Intro visual baseline and texture-budget caveat
+- `ceb5eb68cd99cb07` fails translation at `0x38` with "a descriptor's
+  address or format read as data". Offline native disassembly shows the
+  earlier `s_load_dwordx4` at `0x28` loads a buffer descriptor and the
+  comparison at `0x34` reads its third dword (`s2`) for zero before the
+  branch at `0x38`. Its resource metadata describes an SRV with stride 16.
+  This identifies a record-count use, not proof that the title reads an
+  address or format there. A correct implementation still needs the actual
+  bound view and its record count: inferring a raw host view from the stride
+  alone is unsafe because the host may bind a structured view instead.
 - `quadhelpers1` ran with `VICTORY_PIXEL_QUAD_HELPERS=1` and was stopped at
   the user's request; `exited=True` in its runner output reflects that stop,
   not a natural exit. It reached the prison corridor (`frame-3106.png`), with
