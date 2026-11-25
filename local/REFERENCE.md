@@ -185,6 +185,12 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   address or format there. A correct implementation still needs the actual
   bound view and its record count: inferring a raw host view from the stride
   alone is unsafe because the host may bind a structured view instead.
+- Offline, enabling `VICTORY_ASSUME_DATA_DESCRIPTOR_2D=1` also enabled the
+  upstream raw-buffer assumption and made `ceb5eb68cd99cb07` validate and
+  create a host pipeline; it did not execute or establish correct results.
+  `VICTORY_ASSUME_DATA_BUFFER_RAW=1` now selects only the four-dword buffer
+  assumption, separately from the 2D-texture assumption. It remains off by
+  default until the bound view and actual count are verified.
 - `quadhelpers1` ran with `VICTORY_PIXEL_QUAD_HELPERS=1` and was stopped at
   the user's request; `exited=True` in its runner output reflects that stop,
   not a natural exit. It reached the prison corridor (`frame-3106.png`), with
