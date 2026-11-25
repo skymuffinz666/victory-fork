@@ -4294,6 +4294,16 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// Experimental pixel-quad handling after Belobug's VIctory fork commit
+    /// 03629f3: quad reads include helper pixels that wave reads may not.
+    /// Off until verified on the host GPU.
+    fn pixel_quad_helpers(&self, quad: bool) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        quad && self.s.pixel && *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_PIXEL_QUAD_HELPERS").is_some_and(|v| v == "1")
+        })
+    }
+
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
@@ -4414,7 +4424,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.pixel_quad_helpers(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6731,7 +6741,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.pixel_quad_helpers(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
