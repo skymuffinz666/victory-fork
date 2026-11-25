@@ -198,6 +198,16 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   pieces are now grouped into one pass per contiguous run by default. This
   preserves the exact piece set and cannot lose a detected shader write,
   but the change has only passed a build check; no FPS claim follows.
+- Default translation fix: the structure pass already recorded non-EXEC
+  derived lane masks in its `other` table, but the lowering pass only read
+  `masks`. `Structured::select_mask` now reads both in the two places that
+  already require a mask (`v_cndmask_b32` / carry-in, and select masks in
+  general); mask classification is unchanged. All 8 wave64 tests pass, and
+  offline compute `f133e35efed2a48a`, previously refused with "a lane mask
+  exchanged where not every lane runs", now validates and creates a host
+  pipeline (`VICTORY_HOST_MAX_WAVE=32`, `--jobs 1`). The shader was not
+  executed; this is not proof of console-equivalent results or a visual fix.
+  `926c46bab3b86bd6` has no saved container and was not reproduced.
 - `quadhelpers1` ran with `VICTORY_PIXEL_QUAD_HELPERS=1` and was stopped at
   the user's request; `exited=True` in its runner output reflects that stop,
   not a natural exit. It reached the prison corridor (`frame-3106.png`), with

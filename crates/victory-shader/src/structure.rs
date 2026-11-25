@@ -422,6 +422,10 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Non-EXEC-derived values read as masks (uniform selects, constants and
+    /// opaque values). Kept apart from `masks`, which scalar operations also
+    /// consult by value.
+    pub other_masks: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
@@ -446,6 +450,12 @@ pub struct Structured {
 }
 
 impl Structured {
+    /// The lane mask for a value known to be read as one: EXEC-derived first,
+    /// then uniform/constant/opaque masks.
+    pub(crate) fn select_mask(&self, lo: Value) -> Option<Bool> {
+        self.masks.get(&lo).or_else(|| self.other_masks.get(&lo)).copied()
+    }
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -840,6 +850,7 @@ impl<'a> Lanes<'a> {
         self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            other_masks: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
                 .keys()
