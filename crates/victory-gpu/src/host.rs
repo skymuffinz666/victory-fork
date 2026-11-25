@@ -1560,6 +1560,274 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// [`CARD_COMPARE`] with a group of 64 threads to a piece
+/// (`VICTORY_CARD_HASH_WIDE`, on by default; `=0` for the thread a piece).
+///
+/// With a thread a piece, a pass hashes its 64 KiB pieces in 4,096 steps
+/// one after the other, and its time is that of one piece however few
+/// pieces it has: the card waits on one load at a time and runs next to
+/// nothing else. The passes run before every submission's lists (hashes
+/// after ranges were sent up, 300 to 450 a frame) and after them (compares,
+/// about 100). Measured on an RTX 3060 in the first rooms with the frame
+/// rate switches on: the card was 85 % busy, and "our send-and-hash lists"
+/// were 23 to 29 ms of its frame.
+///
+/// Here thread `t` of a piece's group hashes the 16-byte steps `t`, `t +
+/// 64`, `t + 128`... of the piece (neighbouring threads read neighbouring
+/// bytes), and the first thread folds the 64 lane hashes in lane order into
+/// the piece's hash. It is another hash than [`CARD_COMPARE`]'s, so one
+/// process uses one of them for every hash it stores and compares (it is
+/// chosen once). Copies are under 1 GiB (`shadow::card_for`): at most
+/// 16,385 pieces, one group each, within a dispatch's 65,535.
+pub(crate) const CARD_COMPARE_WIDE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;    // the first piece
+    uint skew;     // where the copy starts in its piece 0
+    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
+    uint pieces;
+    uint out_at;   // the first piece's dword in `differs`, in bytes
+    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint4 lanes[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
+    uint i = group.x;
+    if (i >= pieces) return;
+    uint piece = first + i;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ t;
+    [loop]
+    for (uint at = lo + t * 16u; at < hi; at += 1024u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    lanes[t] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (t != 0u) return;
+    uint4 all = uint4(0x27D4EB2Fu, 0x165667B1u, 0xD3A2646Cu, 0xFD7046C5u);
+    [loop]
+    for (uint k = 0u; k < 64u; k++) {
+        all = (all ^ lanes[k]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        all = all.yzwx ^ (all >> 15);
+    }
+    if (compare != 0u) {
+        differs.Store(out_at + i * 4u, any(all != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        if (compare == 2u) hashes.Store4(piece * 16u, all);
+    } else {
+        hashes.Store4(piece * 16u, all);
+    }
+}
+"#;
+
+/// Whether [`CARD_COMPARE_WIDE`] is the compare (`VICTORY_CARD_HASH_WIDE`;
+/// on unless `0`). Chosen once: stored and compared hashes must agree.
+pub(crate) fn card_hash_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_none_or(|v| v != "0"))
+}
+
+/// The compare's source for this process ([`card_hash_wide`]).
+pub(crate) fn card_compare_source() -> &'static str {
+    if card_hash_wide() { CARD_COMPARE_WIDE } else { CARD_COMPARE }
+}
+
+/// The groups a compare pass over `pieces` pieces is dispatched with.
+pub(crate) fn card_compare_groups(pieces: u32) -> u32 {
+    if card_hash_wide() { pieces } else { pieces.div_ceil(64) }
+}
+
+/// Whether the pieces a flight's compare flags come down to the PC inside
+/// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
+/// only with [`relay`]).
+///
+/// With the relay the thread that lands flights fetched the flagged pieces
+/// with a list of its own on the host's queue, the one the submitting
+/// thread keeps filling: the fetch ran behind every flight sent meanwhile.
+/// Measured on an RTX 3070 Laptop: 140.9 ms a frame of that thread waiting
+/// for fetches, for 63 pieces (3.2 MB) in about five fetches, some 28 ms a
+/// fetch spent queued behind newer flights; and the submitting thread
+/// waited 81.7 ms a frame in "title memory read" settles for that thread.
+///
+/// With the switch the compare's list does the fetch: right behind the
+/// compare, [`CARD_FETCH`] copies each piece it flagged into a slot of a
+/// buffer in the PC's memory ([`CardInflight`]), so when the flight's fence
+/// is reached its bytes are there, and the landing merges them
+/// (`Shadow::card_merge_relay`) with no list, signal or wait of its own.
+/// The merge's "fetched after" is the flight's own send number
+/// (`CardPlan::sent_as`): see [`Host::relay_card_back`] for why that is
+/// exact and when a landing falls back to the old fetch.
+fn inflight_fetch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1"))
+}
+
+/// The bytes of the PC's memory pieces fetched inside flights go to
+/// ([`inflight_fetch`]; `VICTORY_CARD_FETCH_INFLIGHT_MB`, 64): 1,024 slots
+/// ([`inflight_slots`]). A flight whose flagged pieces find no free slot
+/// lands the old way.
+fn inflight_fetch_bytes() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_CARD_FETCH_INFLIGHT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64).max(1) << 20
+    })
+}
+
+/// A slot of [`CARD_FETCH`]: a 64 KiB piece as the compare cuts it, widened
+/// to 16 bytes at both ends (one more 16-byte step where the copy does not
+/// start at a multiple of 16 in its piece).
+pub(crate) const INFLIGHT_SLOT: u64 = (64 << 10) + 16;
+
+/// The slots for `bytes` asked of [`inflight_fetch_bytes`]: one per 64 KiB,
+/// rounded down to a power of two (at least 1, at most 2^15: the shader's
+/// byte offsets into the slots are 32-bit), so that
+/// `ticket % slots` runs on without a jump when the 32-bit ticket wraps
+/// (2^32 is a multiple of it; with 1,023 slots it would jump by 4 and two
+/// tickets in the air could share a slot). The buffer is `slots` times
+/// [`INFLIGHT_SLOT`], a little over `bytes`.
+pub(crate) fn inflight_slots(bytes: u64) -> u32 {
+    let wanted = (bytes >> 16).clamp(1, 1 << 15);
+    1u32 << (63 - wanted.leading_zeros())
+}
+
+/// [`CARD_FETCH`]'s table entry for a piece the compare did not flag.
+pub(crate) const INFLIGHT_NONE: u32 = 0xffff_ffff;
+
+/// Where piece `i` of `span` starts in its [`CARD_FETCH`] slot, as an
+/// offset of the copy: the compare's lower bound of the piece, widened down
+/// to 16 bytes (`CARD_COMPARE`, before clamping to the declared range).
+/// What `Shadow::card_piece` gives for the piece lies at or above it, and
+/// within [`INFLIGHT_SLOT`] of it.
+pub(crate) fn inflight_piece_from(span: &crate::shadow::CardSpan, i: u32) -> usize {
+    let lo = (span.first + i) as usize * 65536;
+    let lo = lo.saturating_sub(span.skew as usize);
+    lo & !15
+}
+
+/// Whether the ticket `k` of [`CARD_FETCH`]'s counter gets a slot, with
+/// every ticket below `floor` landed and `slots` slots: the slot is
+/// `k % slots`. The tickets of flights still in the air are at or above
+/// `floor` (they are taken in the queue's order and flights land in that
+/// order), so two that get a slot are fewer than `slots` apart and never
+/// share one. The arithmetic of the shader, for the tests.
+pub(crate) fn inflight_gets_slot(k: u32, floor: u32, slots: u32) -> bool {
+    k.wrapping_sub(floor) < slots
+}
+
+/// The fetch inside a flight ([`inflight_fetch`]), run in the compare's list
+/// right behind the compare of a declared range (a UAV barrier between):
+/// one group per piece (looping where a range has more than 65,535); where
+/// `differs` flags the piece, its first thread takes a ticket of the
+/// counter (`table`'s dword 0) and, if [`inflight_gets_slot`], the group
+/// copies the piece, cut and widened as the compare hashes it, into slot
+/// `ticket % slots` of `fetched`. Every piece's entry in `table` (dword 1 +
+/// its dword in `differs`) is written: the ticket, also one that got no
+/// slot (the landing repeats the test with the plan's `landed`), or
+/// [`INFLIGHT_NONE`].
+pub(crate) const CARD_FETCH: &str = r#"
+#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2)"
+#define SLOT 65552u
+#define NONE 0xffffffffu
+cbuffer Span : register(b0) {
+    uint first;    // the first piece
+    uint skew;     // where the copy starts in its piece 0
+    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
+    uint pieces;
+    uint out_at;   // the first piece's dword in `differs`, in bytes
+    uint landed;   // every ticket below it is landed
+    uint slots;    // slots of `fetched`
+    uint groups;   // groups dispatched
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer differs : register(u0);
+RWByteAddressBuffer table : register(u1);
+RWByteAddressBuffer fetched : register(u2);
+groupshared uint ticket;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
+    [loop]
+    for (uint i = group.x; i < pieces; i += groups) {
+        if (t == 0u) {
+            uint entry = NONE;
+            if (differs.Load(out_at + i * 4u) != 0u) {
+                uint k;
+                table.InterlockedAdd(0, 1u, k);
+                entry = k;
+            }
+            table.Store(4u + out_at + i * 4u, entry);
+            ticket = entry;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        uint k = ticket;
+        GroupMemoryBarrierWithGroupSync();
+        if (k != NONE && (k - landed) < slots) {
+            uint piece = first + i;
+            uint lo = piece * 65536u;
+            lo = lo > skew ? lo - skew : 0u;
+            uint hi = min((piece + 1u) * 65536u - skew, size);
+            lo = lo & ~15u;
+            hi = (hi + 15u) & ~15u;
+            uint into = (k % slots) * SLOT;
+            [loop]
+            for (uint at = lo + t * 16u; at < hi; at += 1024u) {
+                fetched.Store4(into + (at - lo), now.Load4(at));
+            }
+        }
+    }
+}
+"#;
+
+/// Whether the pieces hashed again after ranges were sent up to a copy in
+/// the card's memory are hashed in runs of pieces that touch, each piece
+/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
+/// per range sent up.
+///
+/// These passes are ours, they run on the card before every submission's
+/// lists, and no timing so far names them: each walks its 64 KiB pieces
+/// 16 bytes at a time, 4,096 steps one after the other, so a pass takes
+/// the time of one piece however few its pieces are. Run 102 sent up 514
+/// ranges a frame: 514 such passes. The same pieces are hashed either way;
+/// a piece hashed when it need not be, or not hashed when it should, costs
+/// a fetch that finds nothing and loses no shader write.
+///
+/// `VICTORY_CARD_REHASH_RUNS=alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log: one run then measures both on the
+/// same scene (the card meter's "send-and-hash lists" in the frame log).
+/// Runs 105-110 found no change in the frame, but the card was not the
+/// frame's limit then.
+fn rehash_runs() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_REHASH_RUNS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let joined = (now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(joined), Ordering::Relaxed) != u8::from(joined) {
+                tracing::info!(
+                    "card rehash passes from now (VICTORY_CARD_REHASH_RUNS=alt): {}",
+                    if joined { "JOINED, one pass a run of touching pieces" } else { "one pass a range sent up, as usual" }
+                );
+            }
+            joined
+        }
+    }
+}
+
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
@@ -3030,9 +3298,10 @@ impl Host {
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
+            let source = card_compare_source();
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -3199,7 +3468,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(card_compare_groups(run.pieces), 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3284,7 +3553,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(card_compare_groups(r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
