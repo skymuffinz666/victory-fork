@@ -487,3 +487,13 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
   LDS addresses with no barrier. Completing the refusals needs an ordering
   primitive for intra-region LDS read-after-write across two host waves
   (replicated LDS with a sound, uniform sync point), not a switch.
+- Phase instrumentation (`phases1` run, 126 frame lines, removed again after
+  the measurement because it cost frame time): at the median frame
+  `sync_heaps` took 8.78 ms (p90 46.51 ms), of which 0.62 ms was kernel page
+  reads, 0.00 ms the timed record lookups and 1.13 ms `mirror_record`;
+  **7.36 ms was in `mirror_copied` calls that returned early** (the record's
+  `[tag, index, generation]` was unchanged), about 70 ns each over ~105k such
+  looks a frame. The earlier cross-run fit attributed 74% to `mirror_record`;
+  that counted changed records only, whose share varies greatly (median 11.5k,
+  p90 48.6k). The measured hot path is therefore the per-looked-record `copied`
+  mutex, not the page reads or view creation.
