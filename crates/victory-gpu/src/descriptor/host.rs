@@ -1520,6 +1520,19 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        // A title rewrite can replace a view that a draw already read this
+        // frame. Keep the table's recency, but make the new view stage again
+        // rather than inheriting the earlier view's "up to date" mark.
+        if !seen && stamp == now | TABLED_READ {
+            if let Some(cell) = self.tabled.get(index as usize) {
+                let _ = cell.compare_exchange(
+                    stamp,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
@@ -3556,6 +3569,23 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A slot a draw already read this frame can be written again before the
+    /// next draw. The new view is not up to date just because the old one was.
+    #[test]
+    fn a_title_rewrite_clears_this_frames_read_mark() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let frame = 100;
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        heap.queue_texture(4, true, false, frame);
+        assert_eq!(slots(frame), [4]);
+        heap.tabled_in(4, true, frame);
+        assert_eq!(slots(frame), [], "a draw read the view: out of the queue");
+        heap.queue_texture(4, true, false, frame);
+        assert_eq!(slots(frame + TABLED_GRACE), [4], "the replacement must stage again");
     }
 
     #[test]

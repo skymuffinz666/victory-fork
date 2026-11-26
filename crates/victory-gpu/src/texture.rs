@@ -81,6 +81,19 @@ struct Last {
     partial: Option<u64>,
 }
 
+impl Last {
+    /// A write published during a submission can have a newer number than
+    /// the write-watch query used for that submission. Remember the newest
+    /// of both: a later check must not pass the texture over as unwritten
+    /// just because its query came back older than the published write.
+    fn advance_watch(&mut self, queried: u64, writes: &[(usize, u64)]) -> bool {
+        let newest = writes.iter().map(|&(_, stamp)| stamp).max().unwrap_or(0);
+        let changed = self.asked == 0 || newest > self.asked;
+        self.asked = self.asked.max(queried).max(newest);
+        changed
+    }
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -920,10 +933,9 @@ impl Staging {
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            if !last.advance_watch(now, &written) {
                 return 0;
             }
-            last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
@@ -949,10 +961,9 @@ impl Staging {
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
-            last.asked = now;
+            let reported_write = last.advance_watch(now, &written);
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if !reported_write && !turn {
                 return 0;
             }
         }
@@ -1366,6 +1377,21 @@ fn mapped_regions(start: usize, end: usize, first_only: bool) -> u64 {
     there
 }
 
+/// A staging buffer's bytes: `GetCopyableFootprints`' total, grown so every
+/// subresource's complete pitched rows fit. Detiling addresses whole rows,
+/// including the padding after the last one, which the total can omit; a
+/// buffer sized only to the total would be too small for those texels.
+fn staging_bytes(total: u64, footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], rows: &[u32]) -> u64 {
+    footprints.iter().zip(rows).fold(total, |total, (footprint, &rows)| {
+        let f = footprint.Footprint;
+        let end = (f.RowPitch as u64)
+            .saturating_mul(rows as u64)
+            .saturating_mul(f.Depth as u64)
+            .saturating_add(footprint.Offset as u64);
+        total.max(end)
+    })
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // Asked before the table is locked: the sweep lets go of a staging
@@ -1413,6 +1439,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
+    let total = staging_bytes(total, &footprints, &rows);
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -1449,7 +1476,49 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{staging_bytes, with_title};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
+
+    /// A write published while a submission prepared is newer than the
+    /// query: taking the query's number as "asked" would skip that write on
+    /// the next check.
+    #[test]
+    fn a_newer_write_stamp_is_not_lost() {
+        let mut last = super::Last::default();
+        assert!(last.advance_watch(5, &[(0, 7)]));
+        assert_eq!(last.asked, 7);
+        assert!(!last.advance_watch(6, &[(0, 7)]), "nothing newer than 7");
+        assert_eq!(last.asked, 7, "an older query must not overwrite the stamp");
+        assert!(last.advance_watch(6, &[(0, 9)]));
+        assert_eq!(last.asked, 9);
+    }
+
+    /// `GetCopyableFootprints` can leave the padding after a subresource's
+    /// last row out of its total; detiling addresses whole pitched rows.
+    #[test]
+    fn staging_includes_the_last_rows_padding() {
+        let footprint = |offset: u64, row_pitch: u32, height: u32, depth: u32| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: DXGI_FORMAT_R8_UNORM,
+                Width: 3,
+                Height: height,
+                Depth: depth,
+                RowPitch: row_pitch,
+            },
+        };
+        // Two rows of three bytes at a pitch of four: the data is six bytes
+        // but detiling reads eight (two complete rows).
+        let one = [footprint(0, 4, 2, 1)];
+        assert_eq!(staging_bytes(6, &one, &[2]), 8);
+        // A later subresource's offset plus its rows sets the end.
+        let two = [footprint(0, 4, 2, 1), footprint(8, 16, 3, 2)];
+        assert_eq!(staging_bytes(6, &two, &[2, 3]), 104);
+        // A total that already covers everything is left alone.
+        assert_eq!(staging_bytes(256, &two, &[2, 3]), 256);
+    }
+
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
