@@ -14,6 +14,46 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+/// A barrier before a write does not fence that write for the other half's
+/// subsequent read. Consecutive read-only accesses can still share a meeting.
+#[test]
+fn an_unguarded_lds_write_invalidates_the_preceding_meeting() {
+    let mut words = [
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7E02_0200, // v_mov_b32 v1, s0
+        0xD834_0000, 0x0000_0105, // ds_write_b32 v5, v1
+        0xD8D8_0000, 0x0600_0005, // ds_read_b32 v6, v5
+        0xD8D8_0000, 0x0700_0005, // ds_read_b32 v7, v5
+        0xE070_0000, 0x8002_0600, // buffer_store_dword v6, off, s[8:11], 0
+        0xE070_0004, 0x8002_0700, // buffer_store_dword v7, off, s[8:11], 0 offset:4
+    ];
+    for (opcode, name, result) in [
+        (0x0D, "ds_write_b32", 0),
+        (0x0A, "ds_or_b32", 0),
+        (0x2D, "ds_wrxchg_rtn_b32", 2),
+    ] {
+        words[2] = 0xD800_0000 | opcode << 18;
+        words[3] = result << 24 | 0x0000_0105;
+        let mut native = native(&words);
+        let StageIo::Cs(cs) = &mut native.io else { unreachable!() };
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        lower::TEST_LDS_ORDER.with(|order| order.borrow_mut().clear());
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        assert_eq!(LAST_WAVE.get(), Some(32));
+        lower::TEST_LDS_ORDER.with(|order| {
+            assert_eq!(
+                *order.borrow(),
+                ["meeting", name, "meeting", "ds_read_b32", "ds_read_b32"],
+                "{name}: a post-write meeting is required, but consecutive reads can coalesce"
+            );
+        });
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+    }
+}
+
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
 /// the result to dword 0 of the raw UAV.
@@ -566,6 +606,11 @@ fn lds_write_and_read_in_one_widened_branch_are_visible_across_halves() {
         0x340A_0882, // v_lshlrev_b32 v5, 2, v4       -> LDS byte address 0 or 4
         0x3A0E_0A84, // v_xor_b32 v7, 4, v5           -> the other half's LDS address
         0x3406_0083, // v_lshlrev_b32 v3, 3, v0       -> UAV byte address 8 * t
+        // D3D12 groupshared memory is not guaranteed to start at zero. Both
+        // slots must be initialized before the conditional writers OR bits.
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xD834_0000, 0x0000_0205, // ds_write_b32 v5, v2
+        0xD834_0000, 0x0000_0207, // ds_write_b32 v7, v2
         0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0      -> lanes below s0 write
         0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
         0xBF88_000A, // s_cbranch_execz over the ten body dwords

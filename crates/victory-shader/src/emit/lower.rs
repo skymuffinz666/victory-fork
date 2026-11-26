@@ -1082,6 +1082,9 @@ pub fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    // Per-access meetings and LDS accesses, in emission order. Hardware scheduling can
+    // hide a missing group wait, so tests also check the lowering's ordering directly.
+    pub(super) static TEST_LDS_ORDER: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -4871,7 +4874,13 @@ impl<'a> Lower<'a> {
                 let void = self.s.t.void;
                 self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 self.meet_clean = Some(self.cur);
+                #[cfg(test)]
+                TEST_LDS_ORDER.with(|order| order.borrow_mut().push("meeting"));
             }
+        }
+        #[cfg(test)]
+        if matches!(inst.fields, Fields::Ds { .. }) {
+            TEST_LDS_ORDER.with(|order| order.borrow_mut().push(name));
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
@@ -4918,6 +4927,18 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        // The meeting above orders accesses BEFORE this instruction. A write
+        // performed by the instruction must invalidate it AFTER emission too:
+        // otherwise an unguarded write and read in the same DXIL block reuse
+        // the pre-write fence, racing the two host halves. Guarded stores used
+        // to hide this by moving `cur` to a fresh join block.
+        if matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_read")
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute"))
+        {
+            self.meet_clean = None;
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
