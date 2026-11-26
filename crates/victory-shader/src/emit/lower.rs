@@ -825,6 +825,26 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
+/// Skip a title `s_barrier` when the translation has just emitted the same
+/// group wait and shared-memory fence and no store or LDS write has happened
+/// since. On RDNA 2 both are wave/workgroup rendezvous; on a console wave
+/// split into two host waves a second wait costs a serialization of the two
+/// halves for nothing. Off unless asked: an A/B must show it is worth it.
+fn barrier_coalesce() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BARRIER_COALESCE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_COALESCE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's barrier-coalescing setting, for its thread only.
+    pub(super) static TEST_BARRIER_COALESCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// An LDS instruction whose effect depends on the dword already there AND
 /// cannot be left unordered with the other half. A commutative RMW whose old
 /// value nobody reads (`ds_add_u32`, `ds_min_u32`, `ds_or_b32`, ...) is only a
@@ -4886,6 +4906,17 @@ impl<'a> Lower<'a> {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
+                // A meeting emitted by the translation in this same block,
+                // with no store or LDS write since, already has the group
+                // wait and shared-memory fence this barrier asks for.
+                if barrier_coalesce()
+                    && super::group_sync() == 2
+                    && !self.fence_only.contains(&b)
+                    && !self.writes_uavs
+                    && self.meet_clean == Some(self.cur)
+                {
+                    return Ok(());
+                }
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
@@ -4902,6 +4933,8 @@ impl<'a> Lower<'a> {
                 }
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
+                #[cfg(test)]
+                TEST_LDS_ORDER.with(|order| order.borrow_mut().push("s_barrier"));
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())

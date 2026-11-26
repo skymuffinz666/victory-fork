@@ -13,6 +13,75 @@ use crate::native::{
 use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+const S_BARRIER: u32 = 0xBF8A_0000;
+
+/// A title barrier directly after the translation's own meeting, with no
+/// store between, asks for the same group wait and shared-memory fence.
+#[test]
+fn a_title_barrier_after_a_meeting_can_be_coalesced() {
+    let words = [
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7E02_0200, // v_mov_b32 v1, s0
+        0xD834_0000, 0x0000_0105, // ds_write_b32 v5, v1
+        0xD8D8_0000, 0x0600_0005, // ds_read_b32 v6, v5
+        S_BARRIER,
+        0xD834_0000, 0x0000_0605, // ds_write_b32 v5, v6
+    ];
+    let mut program_native = native(&words);
+    let StageIo::Cs(cs) = &mut program_native.io else { unreachable!() };
+    cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    let p = ir::build(&program_native.code, program_native.wave64, program_native.vgprs).expect("ir::build");
+    for on in [false, true] {
+        lower::TEST_BARRIER_COALESCE.set(Some(on));
+        lower::TEST_LDS_ORDER.with(|order| order.borrow_mut().clear());
+        let shader = lowered(&program_native, &p, &HashSet::new()).expect("lower");
+        let order = lower::TEST_LDS_ORDER.with(|order| order.borrow().clone());
+        if on {
+            assert_eq!(
+                order,
+                ["meeting", "ds_write_b32", "meeting", "ds_read_b32", "meeting", "ds_write_b32"],
+                "the title's redundant barrier is dropped"
+            );
+        } else {
+            assert_eq!(
+                order,
+                [
+                    "meeting",
+                    "ds_write_b32",
+                    "meeting",
+                    "ds_read_b32",
+                    "s_barrier",
+                    "meeting",
+                    "ds_write_b32"
+                ],
+                "without the switch every title barrier is emitted"
+            );
+        }
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+    }
+    // A write between the meeting and the title's barrier invalidates it.
+    let words = [
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7E02_0200, // v_mov_b32 v1, s0
+        0xD834_0000, 0x0000_0105, // ds_write_b32 v5, v1
+        0xD8D8_0000, 0x0600_0005, // ds_read_b32 v6, v5
+        0xD834_0000, 0x0000_0605, // ds_write_b32 v5, v6
+        S_BARRIER,
+        0xD834_0000, 0x0000_0605, // ds_write_b32 v5, v6
+    ];
+    let mut written = native(&words);
+    let StageIo::Cs(cs) = &mut written.io else { unreachable!() };
+    cs.rsrc2 |= 1 << 15;
+    let p = ir::build(&written.code, written.wave64, written.vgprs).expect("ir::build");
+    lower::TEST_BARRIER_COALESCE.set(Some(true));
+    lower::TEST_LDS_ORDER.with(|order| order.borrow_mut().clear());
+    lowered(&written, &p, &HashSet::new()).expect("lower");
+    let order = lower::TEST_LDS_ORDER.with(|order| order.borrow().clone());
+    assert!(order.iter().any(|&op| op == "s_barrier"), "a write invalidates the meeting: {order:?}");
+    lower::TEST_BARRIER_COALESCE.set(None);
+}
 
 /// A barrier before a write does not fence that write for the other half's
 /// subsequent read. Consecutive read-only accesses can still share a meeting.
