@@ -1258,7 +1258,10 @@ extern "system" fn clear_rtv(
         if let Some(list) = list {
             // Clears are not draws; without a line here an ops trace cannot
             // say whether a target that keeps stale texels was cleared.
-            list.note_op(|| format!("clear rtv {handle:#x}"));
+            list.note_op(|| {
+                let resource = crate::descriptor::rtv_record(handle).map(|r| r.resource as usize).unwrap_or(0);
+                format!("clear rtv {handle:#x} of {resource:#x}")
+            });
         }
         let Some(list) = list else {
             return;
