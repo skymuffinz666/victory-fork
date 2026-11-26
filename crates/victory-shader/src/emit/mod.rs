@@ -1811,4 +1811,63 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    /// A pixel shader that narrows EXEC for a search, branches past the
+    /// fallback and restores EXEC before its export must not keep a lane
+    /// guard on that export: a guard becomes `discard` and leaves the pixel
+    /// unchanged when the title never clears the target.
+    #[test]
+    #[cfg(windows)]
+    fn a_masked_branch_restoring_exec_does_not_guard_the_export() {
+        let [e0, e1] = exp_mrt0(4);
+        let words = [
+            0xBE80_047E, // s_mov_b64 s[0:1], exec
+            0x7DAA_16FF, 0x0000_FFFF, // v_cmpx_ne_u32 exec, 0xffff, v11
+            0xBF88_0001, // s_cbranch_execz over the restore
+            0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: PERSP_CENTER,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let export = (0..p.blocks.len())
+            .find(|&b| {
+                p.blocks[b]
+                    .insts
+                    .iter()
+                    .any(|i| matches!(i.fields, crate::gfx10::Fields::Exp { .. }))
+            })
+            .expect("the export block");
+        assert!(
+            st.guards[export].iter().all(Option::is_none),
+            "the exec restore must reconverge before the export: {:?}",
+            st.guards[export]
+        );
+        let shader = pixel(&words, PERSP_CENTER).expect("lower");
+        validate(&shader);
+    }
 }
