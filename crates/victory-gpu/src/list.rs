@@ -1215,6 +1215,31 @@ pub(crate) struct Rect {
     bottom: i32,
 }
 
+/// Diagnostics: `ClearRenderTargetView` calls and why one was not issued.
+/// 0 calls, 1 no host list, 2 no title RTV record, 3 no host texture,
+/// 4 no host, 5 null colour, 6 issued.
+#[cfg(windows)]
+static CLEAR_WHY: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+#[cfg(windows)]
+pub(crate) fn clear_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = [0, 1, 2, 3, 4, 5, 6].map(|i| CLEAR_WHY[i].swap(0, Relaxed));
+    if n[0] == 0 {
+        return;
+    }
+    tracing::info!(
+        "render-target clears: {:.0} asked per frame, {:.0} issued; not issued: {:.0} without a host list, {:.0} without a title record, {:.0} without a host texture, {:.0} without a host, {:.0} with no colour",
+        n[0] as f64 / frames,
+        n[6] as f64 / frames,
+        n[1] as f64 / frames,
+        n[2] as f64 / frames,
+        n[3] as f64 / frames,
+        n[4] as f64 / frames,
+        n[5] as f64 / frames,
+    );
+}
+
 extern "system" fn clear_rtv(
     this: This,
     handle: u64,
@@ -1224,25 +1249,38 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
+        CLEAR_WHY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let list = host_list(this);
+        if list.is_none() {
+            CLEAR_WHY[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some(list) = list {
             // Clears are not draws; without a line here an ops trace cannot
             // say whether a target that keeps stale texels was cleared.
             list.note_op(|| format!("clear rtv {handle:#x}"));
         }
-        let (Some(list), Some(record)) = (list, crate::descriptor::rtv_record(handle))
-        else {
+        let Some(list) = list else {
+            return;
+        };
+        let Some(record) = crate::descriptor::rtv_record(handle) else {
+            CLEAR_WHY[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         };
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
         ) else {
+            if crate::resource::host_resource(record.resource).is_none() {
+                CLEAR_WHY[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                CLEAR_WHY[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return;
         };
         // SAFETY: the title passes four floats (null is tolerated).
         let Some(color) = (unsafe { color.as_ref() }) else {
+            CLEAR_WHY[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         };
         let rects = (count > 0 && !rects.is_null()).then(|| {
@@ -1262,6 +1300,7 @@ extern "system" fn clear_rtv(
                 )]);
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
+            CLEAR_WHY[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
     #[cfg(not(windows))]
