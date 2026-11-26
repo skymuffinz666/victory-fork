@@ -536,10 +536,6 @@ struct Lanes<'a> {
     phi_join_ids: HashSet<Value>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
-    /// Per block: EXEC after a plain `s_mov_b64 exec, s[...]` restore. Only
-    /// that form reconverges lanes a `v_cmpx` branch narrowed; a mask
-    /// operation that writes EXEC does not, so its edges still use entry EXEC.
-    last: Vec<Option<Bool>>,
     /// Per block ending in a branch: when a lane takes it.
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
@@ -626,7 +622,6 @@ impl<'a> Lanes<'a> {
             phi_joins: Vec::new(),
             phi_join_ids: HashSet::new(),
             first: vec![Bool::FALSE; blocks.len()],
-            last: vec![None; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
             wide: HashSet::new(),
@@ -665,19 +660,6 @@ impl<'a> Lanes<'a> {
             self.masks.insert((lo, hi), Bool::TRUE);
             self.active.insert(lo);
         }
-        // A block that begins by restoring EXEC from a saved copy rejoins
-        // the lanes a `v_cmpx` branch narrowed.
-        let restores: Vec<bool> = p
-            .blocks
-            .iter()
-            .map(|b| {
-                b.insts.first().is_some_and(|i| {
-                    i.name() == "s_mov_b64"
-                        && i.write(Reg::S(EXEC)).is_some()
-                        && i.read(Reg::S(0)).is_some()
-                })
-            })
-            .collect();
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
         for n in 0..self.order.len() {
@@ -686,8 +668,7 @@ impl<'a> Lanes<'a> {
             for k in 0..self.incoming[b].len() {
                 let (q, taken) = self.incoming[b][k];
                 if self.index[q] < n {
-                    let at_exit = self.last[q].unwrap_or(self.first[q]);
-                    let e = self.edge(at_exit, q, taken);
+                    let e = self.edge(self.first[q], q, taken);
                     c = self.b.or(c, e);
                 }
             }
@@ -709,20 +690,6 @@ impl<'a> Lanes<'a> {
                 self.step(inst, now);
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
-                    // A plain `s_mov_b64 exec, s[...]` restores the lanes
-                    // saved before a `v_cmpx` branch; its successors arrive
-                    // with that EXEC, not with the narrowed entry mask.
-                    let plain_restore = inst.name() == "s_mov_b64"
-                        && inst.write(Reg::S(EXEC)).is_some()
-                        && inst.read(Reg::S(0)).is_some();
-                    // A branch tests EXEC at its end, so its outgoing edges
-                    // carry the narrowed value when one side restores EXEC.
-                    let joins_restore = match p.blocks[b].exit {
-                        Exit::Branch { taken, not_taken } => restores[taken] || restores[not_taken],
-                        _ => false,
-                    };
-                    let keep = plain_restore || joins_restore;
-                    self.last[b] = if keep { now } else { None };
                 }
             }
             if let Exit::Branch { .. } = p.blocks[b].exit
@@ -771,8 +738,7 @@ impl<'a> Lanes<'a> {
                 let mut failed = false;
                 for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
                     let (q, taken) = self.incoming[block][n];
-                    let at_exit = self.last[q].unwrap_or(cond[q]);
-                    let e = self.edge(at_exit, q, taken);
+                    let e = self.edge(cond[q], q, taken);
                     let (mut m, d) = self.mask(a);
                     if !was_derived
                         && d
@@ -823,9 +789,8 @@ impl<'a> Lanes<'a> {
                 .enumerate()
                 .map(|(n, a)| {
                     let (q, taken) = self.incoming[pj.block][n];
-                    let at_exit = self.last[q].unwrap_or(cond[q]);
-                    let e = self.edge(at_exit, q, taken);
-                    let (m, _) = self.mask(a);
+                    let e = self.edge(cond[q], q, taken);
+                    let m = self.mask(a).0;
                     self.b.given(m, e)
                 })
                 .collect();
@@ -1013,8 +978,7 @@ impl<'a> Lanes<'a> {
             if self.index[q] < self.index[block] {
                 let (m, d) = self.mask(a);
                 derived |= d;
-                let at_exit = self.last[q].unwrap_or(self.first[q]);
-                let e = self.edge(at_exit, q, taken);
+                let e = self.edge(self.first[q], q, taken);
                 forward.push((e, m));
             } else {
                 self.seen.push(a);
@@ -1091,11 +1055,8 @@ impl<'a> Lanes<'a> {
         let Fields::Sop { dst, src, .. } = &inst.fields else {
             return None;
         };
-        // EXEC is a 64-bit register even in wave32 programs, so its
-        // save/restore forms stay `_b64` there. Accept either width; a
-        // `_b32` operand names the low word we track.
-        let op = inst.name().strip_prefix("s_")?;
-        let op = op.strip_suffix("_b64").or_else(|| op.strip_suffix("_b32"))?;
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let op = inst.name().strip_prefix("s_")?.strip_suffix(width)?;
         let dst = match dst {
             Some(Operand::Scalar { code, .. }) if *code != NULL => {
                 self.key(|r| inst.write(r), *code)
@@ -1425,8 +1386,7 @@ impl<'a> Lanes<'a> {
                 let mut c = Bool::FALSE;
                 for k in 0..self.incoming[s].len() {
                     let (q, taken) = self.incoming[s][k];
-                    let at_exit = self.last[q].unwrap_or(cond[q]);
-                    let mut e = self.edge(at_exit, q, taken);
+                    let mut e = self.edge(cond[q], q, taken);
                     if i <= self.index[q] {
                         e = self.b.forget(e, i, &mut Map::default());
                     }
