@@ -1224,7 +1224,14 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
+        let list = host_list(this);
+        #[cfg(feature = "diagnostics")]
+        if let Some(list) = list {
+            // Clears are not draws; without a line here an ops trace cannot
+            // say whether a target that keeps stale texels was cleared.
+            list.note_op(|| format!("clear rtv {handle:#x}"));
+        }
+        let (Some(list), Some(record)) = (list, crate::descriptor::rtv_record(handle))
         else {
             return;
         };
