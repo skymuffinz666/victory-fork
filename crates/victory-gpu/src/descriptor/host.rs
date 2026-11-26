@@ -1927,6 +1927,7 @@ impl HostHeap {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
+            crate::descriptor::MIRROR_KIND[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
@@ -1940,6 +1941,8 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            crate::descriptor::MIRROR_KIND[if view.is_buffer() { 1 } else { 0 }]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -1982,6 +1985,8 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+        } else {
+            crate::descriptor::MIRROR_KIND[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Some(view)
     }

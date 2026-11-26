@@ -250,25 +250,37 @@ pub(crate) fn sync_heaps() {
 #[cfg(windows)]
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// What mirrored records did since the last frame line: texture views made
+/// now, buffer views left for their draws, host slots made null, and records
+/// whose key was already made (no host view work).
+pub(crate) static MIRROR_KIND: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros, reads, mirrors] =
         [0, 1, 2, 3, 4, 5].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [textures, buffers, nulls, unchanged] =
+        [0, 1, 2, 3].map(|i| MIRROR_KIND[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.2} ms \
-         ({:.2} ms reading pages through the kernel, {:.2} ms resolving and mirroring slots)",
+         ({:.2} ms reading pages through the kernel, {:.2} ms resolving and mirroring slots: {:.0} texture views, \
+         {:.0} buffer views left for draws, {:.0} nulls, {:.0} already made)",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         micros as f64 / 1000.0 / frames,
         reads as f64 / 1000.0 / frames,
         mirrors as f64 / 1000.0 / frames,
+        textures as f64 / frames,
+        buffers as f64 / frames,
+        nulls as f64 / frames,
+        unchanged as f64 / frames,
     );
 }
 
