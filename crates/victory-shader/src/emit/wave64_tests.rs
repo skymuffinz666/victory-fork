@@ -93,6 +93,12 @@ fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
     }
 }
 
+// The wave size of the last `lowered_on` call on this thread, for tests that must know
+// they really ran the console wave as two host waves.
+thread_local! {
+    static LAST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// `program()` for a host of 32-lane waves, with the branches closing `wide` taken wave-wide.
 fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
     lowered_on(native, p, wide, 32)
@@ -122,6 +128,7 @@ fn lowered_on(
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
+    LAST_WAVE.set(lowered.wave_size);
     Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -539,4 +546,103 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// A console wave64 whose LDS write and read are in one lane branch cannot be split into
+/// two host waves: `lds_meetings` refuses a region that both writes and reads, so the
+/// branch must be widened. Widening makes both host halves reach the per-access group
+/// barriers. This fixture checks that on the card for writer counts on both sides of the
+/// 32-lane split (1/31/32/33/64): lane `t` ORs bit `t & 31` into LDS slot `t >> 5`
+/// (0 for the low half, 1 for the high half), then stores both its own slot and the
+/// other half's slot into its two UAV dwords. Non-writers store nothing (zeros).
+/// A missing cross-half barrier shows up as a zero where the other half's bits must be.
+#[test]
+fn lds_write_and_read_in_one_widened_branch_are_visible_across_halves() {
+    let words = [
+        0x7E02_0281, // v_mov_b32 v1, 1
+        0x2C08_0085, // v_lshrrev_b32 v4, 5, v0       -> half 0 or 1
+        0x360C_009F, // v_and_b32 v6, 31, v0          -> bit within the half
+        0x3402_0306, // v_lshlrev_b32 v1, v6, v1      -> 1 << bit
+        0x340A_0882, // v_lshlrev_b32 v5, 2, v4       -> LDS byte address 0 or 4
+        0x3A0E_0A84, // v_xor_b32 v7, 4, v5           -> the other half's LDS address
+        0x3406_0083, // v_lshlrev_b32 v3, 3, v0       -> UAV byte address 8 * t
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0      -> lanes below s0 write
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000A, // s_cbranch_execz over the ten body dwords
+        0xD828_0000, 0x0000_0105, // ds_or_b32 v5, v1: LDS[own half] |= bit
+        0xD8D8_0000, 0x0600_0005, // ds_read_b32 v6, v5: own half
+        0xD8D8_0000, 0x0700_0007, // ds_read_b32 v7, v7: other half
+        0xE070_1000, 0x8002_0603, // buffer_store_dword v6, v3, s[8:11], 0 offen
+        0xE070_1004, 0x8002_0703, // buffer_store_dword v7, v3, s[8:11], 4 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let mut native = native(&words);
+    if let crate::native::StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 = (5 << 1) | (1 << 15); // 5 user SGPRs and 512 bytes of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the branch");
+    // Per lane the write and the read are in one region: the lowerer records the branch
+    // as needing to be taken wave-wide instead of refusing the program.
+    lower::take_needs();
+    lowered(&native, &p, &HashSet::new()).expect("lower to wave64");
+    assert_eq!(LAST_WAVE.get(), Some(64), "the per-lane form is one console wave");
+    let needs = lower::take_needs();
+    let st = structure::structure(&p).expect("structure");
+    assert_eq!(lower::branches_around(&st, &needs), Some(vec![branch]));
+    assert_eq!(st.wave_any[branch], Some(false));
+    // Wave-wide, both host waves run the LDS accesses and meet at their barriers.
+    let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower to wave32");
+    assert_eq!(LAST_WAVE.get(), Some(32), "the widened form is two host waves");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return;
+        }
+    };
+    let bits = |n: u32| if n == 0 { 0 } else if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+    for writers in [1u32, 31, 32, 33, 64] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = writers;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        for t in 0..64u32 {
+            let (own, other) = if t >= writers {
+                (0, 0)
+            } else if t < 32 {
+                (bits(writers.min(32)), bits(writers.saturating_sub(32)))
+            } else {
+                (bits(writers.saturating_sub(32)), bits(writers.min(32)))
+            };
+            assert_eq!(out[0][2 * t as usize], own, "{writers} writers, lane {t}: its own half's LDS");
+            assert_eq!(out[0][2 * t as usize + 1], other, "{writers} writers, lane {t}: the other half's LDS");
+        }
+    }
+    eprintln!("ran on the hardware device: both halves' LDS writes are visible for 1/31/32/33/64 writers");
 }
