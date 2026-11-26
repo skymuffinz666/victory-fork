@@ -177,6 +177,7 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    let (mut read_us, mut mirror_us) = (0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
@@ -200,8 +201,11 @@ pub(crate) fn sync_heaps() {
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
+                let read_started = std::time::Instant::now();
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                    read_us += read_started.elapsed().as_micros() as u64;
                     pages += 1;
+                    let mirror_started = std::time::Instant::now();
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     for index in slots {
                         let handle = start + index * step;
@@ -220,38 +224,51 @@ pub(crate) fn sync_heaps() {
                             mirrored += 1;
                         }
                     }
+                    mirror_us += mirror_started.elapsed().as_micros() as u64;
                 }
                 page += crate::watch::PAGE;
             }
         }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+    for (count, n) in SYNCED.iter().zip([
+        pages,
+        looked,
+        mirrored,
+        started.elapsed().as_micros() as u64,
+        read_us,
+        mirror_us,
+    ]) {
         count.fetch_add(n, Relaxed);
     }
 }
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), and the microseconds it took.
+/// not the one last seen (mirrored), the microseconds it took, and how much
+/// of that was kernel reads against resolving and mirroring slots.
 #[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [pages, looked, mirrored, micros, reads, mirrors] =
+        [0, 1, 2, 3, 4, 5].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.2} ms",
+         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.2} ms \
+         ({:.2} ms reading pages through the kernel, {:.2} ms resolving and mirroring slots)",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
-        micros as f64 / 1000.0 / frames
+        micros as f64 / 1000.0 / frames,
+        reads as f64 / 1000.0 / frames,
+        mirrors as f64 / 1000.0 / frames,
     );
 }
 
