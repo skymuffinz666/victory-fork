@@ -92,6 +92,17 @@ impl Last {
         self.asked = self.asked.max(queried).max(newest);
         changed
     }
+
+    /// Unchanged partial textures are polled infrequently. A reported write
+    /// must bypass that throttle: advancing `asked` before skipping the read
+    /// would otherwise consume the notification without refreshing its texels.
+    fn partial_due(&mut self, frame: u64, reported_write: bool) -> bool {
+        if !reported_write && self.partial.is_some_and(|at| frame.saturating_sub(at) < 30) {
+            return false;
+        }
+        self.partial = Some(frame);
+        true
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -957,11 +968,12 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut reported_write = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
-            let reported_write = last.advance_watch(now, &written);
+            reported_write = last.advance_watch(now, &written);
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             if !reported_write && !turn {
                 return 0;
@@ -989,14 +1001,13 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
+            // Poll unchanged partial textures at most every 30 frames, but
+            // do not discard a page-write/remap notification the guard just
+            // reported. Streamed-in texels must be refreshed immediately.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if !last.partial_due(frame, reported_write) {
                 return 0;
             }
-            last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
@@ -1381,15 +1392,21 @@ fn mapped_regions(start: usize, end: usize, first_only: bool) -> u64 {
 /// subresource's complete pitched rows fit. Detiling addresses whole rows,
 /// including the padding after the last one, which the total can omit; a
 /// buffer sized only to the total would be too small for those texels.
-fn staging_bytes(total: u64, footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], rows: &[u32]) -> u64 {
-    footprints.iter().zip(rows).fold(total, |total, (footprint, &rows)| {
+fn staging_bytes(total: u64, footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], rows: &[u32]) -> Option<u64> {
+    if footprints.len() != rows.len() {
+        return None;
+    }
+    let bytes = footprints.iter().zip(rows).try_fold(total, |total, (footprint, &rows)| {
         let f = footprint.Footprint;
         let end = (f.RowPitch as u64)
-            .saturating_mul(rows as u64)
-            .saturating_mul(f.Depth as u64)
-            .saturating_add(footprint.Offset as u64);
-        total.max(end)
-    })
+            .checked_mul(rows as u64)?
+            .checked_mul(f.Depth as u64)?
+            .checked_add(footprint.Offset)?;
+        Some(total.max(end))
+    })?;
+    // `detile` constructs slices into this allocation. Rust slices cannot
+    // span more than isize::MAX bytes even when a GPU address would fit u64.
+    (bytes <= isize::MAX as u64).then_some(bytes)
 }
 
 /// The staging state of a title texture, made on first use.
@@ -1439,7 +1456,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let total = staging_bytes(total, &footprints, &rows);
+    let total = staging_bytes(total, &footprints, &rows)?;
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -1494,6 +1511,21 @@ mod title_memory_tests {
         assert_eq!(last.asked, 9);
     }
 
+    #[test]
+    fn a_reported_write_bypasses_the_partial_texture_poll_interval() {
+        let mut last = super::Last::default();
+        assert!(last.partial_due(100, false));
+        assert!(!last.partial_due(101, false));
+        assert!(last.advance_watch(1, &[(0, 1)]));
+        assert!(last.partial_due(101, true), "refresh the reported write now");
+        assert!(!last.advance_watch(2, &[(0, 1)]));
+        assert!(!last.partial_due(102, false), "unchanged textures stay throttled");
+        assert!(!last.partial_due(130, false));
+        assert!(last.partial_due(131, false), "retain periodic polling for unseen writes");
+        last.partial = Some(u64::MAX - 1);
+        assert!(!last.partial_due(u64::MAX, false), "frame arithmetic must not overflow");
+    }
+
     /// `GetCopyableFootprints` can leave the padding after a subresource's
     /// last row out of its total; detiling addresses whole pitched rows.
     #[test]
@@ -1511,12 +1543,18 @@ mod title_memory_tests {
         // Two rows of three bytes at a pitch of four: the data is six bytes
         // but detiling reads eight (two complete rows).
         let one = [footprint(0, 4, 2, 1)];
-        assert_eq!(staging_bytes(6, &one, &[2]), 8);
+        assert_eq!(staging_bytes(6, &one, &[2]), Some(8));
         // A later subresource's offset plus its rows sets the end.
         let two = [footprint(0, 4, 2, 1), footprint(8, 16, 3, 2)];
-        assert_eq!(staging_bytes(6, &two, &[2, 3]), 104);
+        assert_eq!(staging_bytes(6, &two, &[2, 3]), Some(104));
         // A total that already covers everything is left alone.
-        assert_eq!(staging_bytes(256, &two, &[2, 3]), 256);
+        assert_eq!(staging_bytes(256, &two, &[2, 3]), Some(256));
+        assert_eq!(staging_bytes(6, &two, &[2]), None, "every footprint needs a row count");
+        assert_eq!(staging_bytes(u64::MAX, &one, &[2]), None, "a CPU slice must fit isize");
+        let huge = [footprint(0, u32::MAX, 2, u32::MAX)];
+        assert_eq!(staging_bytes(0, &huge, &[u32::MAX]), None, "row extent overflow");
+        let near_end = [footprint(u64::MAX - 1, 4, 2, 1)];
+        assert_eq!(staging_bytes(0, &near_end, &[2]), None, "subresource end overflow");
     }
 
 
