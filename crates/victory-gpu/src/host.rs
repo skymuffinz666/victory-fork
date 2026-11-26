@@ -1629,16 +1629,20 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 }
 "#;
 
-/// Whether [`CARD_COMPARE_WIDE`] is the compare (`VICTORY_CARD_HASH_WIDE=1`;
-/// off unless asked: it has not run in a game on this tree yet, and it is
-/// another hash with another rare pattern of changes it cannot see). Chosen
-/// once and said in the log: stored and compared hashes must agree.
+/// Whether [`CARD_COMPARE_WIDE`] is the compare: one group of 64 threads per
+/// piece, on by default after two alternating runs on this machine showed
+/// ~5.0-6.0 fps against ~4.3-5.2 with the old form, and ~64-76 ms of fetch
+/// wait against ~82-118 ms (`work/hashwide1`, `hashwide2`, `baseline_after`).
+/// `VICTORY_CARD_HASH_WIDE=0` restores one thread per piece. It is another
+/// hash with another rare pattern of changes it cannot see; both forms were
+/// clean in-game, with no new pipeline refusals. Chosen once and said in the
+/// log: stored and compared hashes must agree.
 pub(crate) fn card_hash_wide() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_CARD_HASH_WIDE").is_some_and(|v| v == "1");
-        if on {
-            tracing::info!("the card's hashes of copies' pieces are made by a group of 64 threads a piece (VICTORY_CARD_HASH_WIDE=1)");
+        let on = std::env::var_os("VICTORY_CARD_HASH_WIDE").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("the card's hashes of copies' pieces are made by one thread a piece (VICTORY_CARD_HASH_WIDE=0)");
         }
         on
     })
