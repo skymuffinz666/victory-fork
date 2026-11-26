@@ -26,24 +26,33 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
 
-/// The kinds copied back: (width, height, format).
+/// The kind spec `VICTORY_TEXTURE_BACK=1` stands for: the ocean's height
+/// and displacement maps found by the upstream trace.
+const DEFAULT_SPEC: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
+
+/// Parse a comma-separated `<width>x<height>f<format>` spec. Bad entries
+/// are dropped, so an unset (`""`) or otherwise empty spec copies nothing.
+fn parse_kinds(spec: &str) -> Vec<(u64, u32, u32)> {
+    spec.split(',')
+        .filter_map(|k| {
+            let (size, format) = k.trim().split_once('f')?;
+            let (w, h) = size.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The kinds copied back: (width, height, format). Off unless
+/// `VICTORY_TEXTURE_BACK` is set (`1` for the four water kinds, or a spec).
 fn kinds() -> &'static [(u64, u32, u32)] {
     static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
     KINDS.get_or_init(|| {
-        const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
         let list = match std::env::var("VICTORY_TEXTURE_BACK").as_deref() {
-            Ok("1") => DEFAULT.to_owned(),
+            Ok("1") => DEFAULT_SPEC.to_owned(),
             Ok(spec) => spec.to_owned(),
             Err(_) => String::new(),
         };
-        let kinds: Vec<(u64, u32, u32)> = list
-            .split(',')
-            .filter_map(|k| {
-                let (size, format) = k.trim().split_once('f')?;
-                let (w, h) = size.split_once('x')?;
-                Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
-            })
-            .collect();
+        let kinds = parse_kinds(&list);
         if !kinds.is_empty() {
             tracing::info!(?kinds, "textures of these kinds that shaders write are copied back into title memory (VICTORY_TEXTURE_BACK)");
         }
@@ -253,6 +262,19 @@ pub(crate) fn land(back: &Back) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_is_off_unless_asked() {
+        // The module reads the variable once; the parser is the pure part.
+        assert!(parse_kinds("").is_empty(), "unset copies nothing");
+        assert!(parse_kinds("0").is_empty(), "`=0` copies nothing");
+        assert!(parse_kinds("garbage").is_empty());
+        assert_eq!(
+            parse_kinds(DEFAULT_SPEC),
+            [(256, 256, 41), (256, 256, 16), (64, 64, 16), (128, 128, 36)]
+        );
+        assert_eq!(parse_kinds(" 32x16f41 , 7x9f16 "), [(32, 16, 41), (7, 9, 16)]);
+    }
 
     #[test]
     fn only_readbacks_for_changed_allocations_are_invalidated() {
