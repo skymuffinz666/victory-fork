@@ -64,6 +64,59 @@ fn set_event(event: usize) {
     let _ = event;
 }
 
+/// Whether a null-event wait really blocks on the fence value instead of
+/// returning `E_NOTIMPL` (`VICTORY_FENCE_BLOCK=1`; opt-in until it has been
+/// measured on this machine). Chosen once: the waiter and the signaler must
+/// agree.
+fn block_fence() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            let on = std::env::var_os("VICTORY_FENCE_BLOCK").is_some_and(|v| v == "1");
+            if on {
+                tracing::info!("a null-event fence wait blocks on the fence value (VICTORY_FENCE_BLOCK=1)");
+            }
+            on
+        }
+        #[cfg(not(windows))]
+        false
+    })
+}
+
+/// Blocks until `value_at` reaches `value` or `timeout` passes. `set` wakes
+/// the wait on the atomic's own address; the short slices and the check at
+/// the deadline also catch a signal that missed the wake. Returns whether
+/// the value was reached.
+#[cfg(windows)]
+fn wait_for_value(value_at: &AtomicU64, value: u64, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let current = value_at.load(Ordering::Acquire);
+        if current >= value {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return value_at.load(Ordering::Acquire) >= value;
+        }
+        let ms = (deadline - now).as_millis().min(10) as u32;
+        // SAFETY: `value_at` is an eight-byte atomic; `current` holds the
+        // value compared; `set` calls WakeByAddressAll on the same address,
+        // and the timeout bounds the wait.
+        unsafe {
+            windows_sys::Win32::System::Threading::WaitOnAddress(
+                (value_at as *const AtomicU64).cast(),
+                (&raw const current).cast(),
+                std::mem::size_of::<u64>(),
+                ms.max(1),
+            );
+        }
+        // What queues hold may be what signals the fence.
+        crate::queue::release_held(false);
+    }
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(
         FENCE,
@@ -98,6 +151,15 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }
+            if block_fence() {
+                // The card's work can still set this fence: wait for it, but
+                // only briefly (cgbj-reupload).
+                if wait_for_value(&fence.value, value, std::time::Duration::from_millis(250)) {
+                    return S_OK;
+                }
+                tracing::warn!(value, "blocking fence wait timed out");
+                return E_NOTIMPL;
+            }
             tracing::warn!(value, "blocking fence wait not implemented");
             return E_NOTIMPL;
         }
@@ -121,6 +183,15 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    if block_fence() {
+        #[cfg(windows)]
+        // SAFETY: wake a thread blocked on the fence's GPU VA by
+        // WaitOnAddress; the address is the same eight-byte atomic.
+        unsafe {
+            windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
+        }
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
@@ -189,5 +260,28 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// The wait wakes on the atomic's own address, and gives up at its
+    /// deadline: both halves of the opt-in blocking wait.
+    #[cfg(windows)]
+    #[test]
+    fn a_blocking_wait_wakes_on_the_fence_address_and_times_out() {
+        static VALUE: AtomicU64 = AtomicU64::new(1);
+        VALUE.store(1, Ordering::Release);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let reached = wait_for_value(&VALUE, 5, std::time::Duration::from_secs(2));
+            tx.send(reached).unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        VALUE.store(5, Ordering::Release);
+        // SAFETY: the same address the waiter passed to WaitOnAddress.
+        unsafe {
+            windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const VALUE).cast());
+        }
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+        assert!(!wait_for_value(&VALUE, 9, std::time::Duration::from_millis(30)));
     }
 }

@@ -196,6 +196,14 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// Gives this submission's dynamic descriptor slots back as soon as the
+    /// card has run it, rather than when the host list is recycled (cgbj-
+    /// reupload): a run of late submissions could otherwise hold 16 frames'
+    /// tables and exhaust NVIDIA's 262,144 slots, dropping draws.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
