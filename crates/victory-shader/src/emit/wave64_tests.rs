@@ -764,3 +764,126 @@ fn lds_write_and_read_in_one_widened_branch_are_visible_across_halves() {
     }
     eprintln!("ran on the hardware device: both halves' LDS writes are visible for 1/31/32/33/64 writers");
 }
+
+/// One console wave of 64 threads with 512 bytes of LDS. Every thread clears the flag; the
+/// threads below s0 raise it and read it back inside their branch. Every thread stores the
+/// final flag plus one at its own UAV dword. `second` adds another write in the branch after
+/// the read: the same constant stays a flag, a different one does not.
+fn flag_program(second: Option<u32>) -> NativeProgram {
+    let mut body = vec![
+        0x7E12_0280, // v_mov_b32 v9, 0
+    ];
+    body.extend_from_slice(&flag_ds(FLAG_WRITE, 0, 9, 9)); // ds_write_b32 v9, v9
+    let mut branch = vec![0x7E04_0281]; // v_mov_b32 v2, 1
+    branch.extend_from_slice(&flag_ds(FLAG_WRITE, 0, 9, 2)); // ds_write_b32 v9, v2
+    // A scalar exit from the branch gives the read blocks of their own, which only its lanes run.
+    let mut rest = flag_ds(FLAG_READ, 3, 9, 0).to_vec(); // ds_read_b32 v3, v9
+    if let Some(k) = second {
+        rest.push(0x7E0C_02FF); // v_mov_b32 v6, lit
+        rest.push(k);
+        rest.extend_from_slice(&flag_ds(FLAG_WRITE, 0, 9, 6)); // ds_write_b32 v9, v6
+    }
+    branch.extend_from_slice(&[
+        0xBF07_8001,                       // s_cmp_lg_u32 s1, 0
+        0xBF85_0000 | rest.len() as u32, // s_cbranch_scc1 past the rest
+    ]);
+    branch.extend_from_slice(&rest);
+    body.extend_from_slice(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | branch.len() as u32, // s_cbranch_execz past the branch
+    ]);
+    body.extend_from_slice(&branch);
+    body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    body.extend_from_slice(&flag_ds(FLAG_READ, 5, 9, 0)); // ds_read_b32 v5, v9
+    body.extend_from_slice(&[
+        0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 1, // buffer_store_dword v5, v1, s[8:11], 0 offen
+    ]);
+    let mut native = native(&body);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    native
+}
+
+/// DS `op vdst, addr, data0` at offset 0.
+const fn flag_ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
+    [0x36 << 26 | (op as u32) << 18, (vdst as u32) << 24 | (data0 as u32) << 8 | addr as u32]
+}
+
+const FLAG_WRITE: u8 = 0x0D;
+const FLAG_READ: u8 = 0x36;
+
+/// The wave size `native` lowers to on a host of 32-lane waves.
+fn flag_wave(native: &NativeProgram) -> Option<u32> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lowered(native, &p, &HashSet::new()).expect("lower");
+    LAST_WAVE.get()
+}
+
+#[test]
+fn a_branch_that_only_raises_an_lds_flag_runs_in_waves_of_32() {
+    // a read that misses the other host wave's write changes nothing the branch leaves behind
+    assert_eq!(flag_wave(&flag_program(None)), Some(32));
+    // after the read the branch writes the flag again, with the same constant
+    assert_eq!(flag_wave(&flag_program(Some(1))), Some(32));
+}
+
+#[test]
+fn a_branch_that_writes_lds_two_different_values_keeps_64_lanes() {
+    // a second value after the read: what the flag ends up holding depends on what was read
+    assert_eq!(flag_wave(&flag_program(Some(2))), Some(64));
+}
+
+/// On a 32-lane host, both halves observe the flag after the join: every lane stores
+/// `1 + (any lane raised it)`, including writer counts on either side of 32 and a scalar
+/// skip of the read inside the branch.
+#[test]
+fn both_host_waves_observe_the_lds_flag_after_the_join() {
+    let native = flag_program(Some(1));
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    assert_eq!(LAST_WAVE.get(), Some(32), "the flag region is two host waves");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return;
+        }
+    };
+    for active in [0u32, 1, 31, 32, 33, 63, 64] {
+        for skip in [0u32, 1] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = [active, skip][d as usize];
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(64)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            assert_eq!(out[0], [1 + u32::from(active != 0); 64], "{active} active lanes, skip {skip}");
+        }
+    }
+    eprintln!("ran on the hardware device: all 14 flag dispatches passed");
+}
