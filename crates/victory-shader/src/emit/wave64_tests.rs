@@ -611,6 +611,10 @@ fn lds_write_and_read_in_one_widened_branch_are_visible_across_halves() {
         0x7E04_0280, // v_mov_b32 v2, 0
         0xD834_0000, 0x0000_0205, // ds_write_b32 v5, v2
         0xD834_0000, 0x0000_0207, // ds_write_b32 v7, v2
+        // Initialize every output lane explicitly as well; non-writers
+        // must not depend on how the test harness allocated its UAV.
+        0xE070_1000, 0x8002_0203, // buffer_store_dword v2, v3, s[8:11], 0 offen
+        0xE070_1004, 0x8002_0203, // buffer_store_dword v2, v3, s[8:11], 4 offen
         0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0      -> lanes below s0 write
         0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
         0xBF88_000A, // s_cbranch_execz over the ten body dwords

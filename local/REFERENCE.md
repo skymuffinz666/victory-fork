@@ -671,7 +671,7 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
 
 - Reproduced an unguarded LDS write→read bug with a new deterministic lowering test: the emitted order was `meeting, write, read, read`, missing the cross-half meeting after the write. The earlier widened-branch hardware fixture hid this case because guarded writes create a fresh DXIL join block.
 - `lower.rs` now invalidates `meet_clean` after emitting an LDS write/RMW, not just before it. The regression test requires `meeting, write, meeting, read, read`: write→read ordering is restored while consecutive reads still coalesce. Test-only emission tracing avoids relying on GPU scheduling to expose a race (the previous fence-only negative control passed on this card).
-- All 8 `emit::wave64_tests` pass, including hardware cross-half visibility for 1/31/32/33/64 writers; diagnostics executable builds. Full saved-pack validation with host wave 32 is pending (`work/lds_barrier_fix_validate.txt`). No experimental defaults changed; in-game visual/performance effects are not yet measured.
+- All 8 `emit::wave64_tests` pass, including hardware cross-half visibility for 1/31/32/33/64 writers; diagnostics executable builds. Full saved-pack validation with host wave 32 (`work/lds_barrier_fix_validate.txt`) matches the recorded baseline: 2867/2867 translated; VS/PS 1267 emitted / 1258 validated / 1267 pipelines, compute 1068/1068/1060, mesh 532/527/532. No experimental defaults changed; in-game visual/performance effects are not yet measured.
 - Expanded the deterministic regression to cover plain LDS stores, commutative OR atomics and returning exchange atomics. The hardware fixture now explicitly initializes both LDS slots: uninitialized D3D12 groupshared contents are not a valid test oracle. All 8 tests still pass; one unrelated wave64-only hardware case reports a skip, not a successful execution.
 
 ### Texture staging safety and partial-refresh follow-up
@@ -685,6 +685,13 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
 - A read-only review suggested the `0x13c8` refusal might be a numeric loop counter spuriously classified as a mask. Temporary instrumentation at `mask_dword` disproved that candidate: failing SSA values `5682` / `4906` (different lowering attempts) are defined by `s_mov_b64 s[24:25], s[96:97]` at native `0x1a54`, in the block starting at `0x1a50`, not by `s47`'s numeric increment. Disassembly shows `s[96:97]` saves `s[24:25]` at `0x163c`; `s[24:25]` is a real compare mask at `0x136c` and is later consumed by `v_cndmask_b32` at `0x1ae0`.
 - Evidence: `work/926_mask_debug.txt` and `work/926c46bab3b86bd6_disasm.txt` (outside Git). Temporary instrumentation removed. No scalar/mask classification change or bypass landed; the exact refusal remains. A review's successful CPU-only `VICTORY_WAVE_WIDE=1` emission (29 widened branches) is not GPU/correctness evidence and does not justify enabling it.
 - CPU shader tests excluding `emit::`: 103/103 pass.
+
+### Combined stability verification follow-up
+
+- Independent read-only audit of `de21419` and `ba3b631` found no blocker in barrier ordering, staging-span safety or partial-write refresh. The per-access test trace is deliberately not a complete trace of title/region barriers. The hardware fixture now initializes every output lane as well as its LDS slots, removing dependency on fresh UAV contents.
+- Strengthened `a_title_rewrite_clears_this_frames_read_mark` with direct read-bit and same-frame next-draw consumption assertions. Negative control with the mark-clearing fix temporarily disabled failed (`TABLED_READ` remained 2147483648); restored code passes. Negative and positive logs are `work/descriptor_rewrite_negative_control.txt` and `work/descriptor_rewrite_positive_control.txt`; no temporary disabling remains.
+- GPU crate diagnostics suite: 153 pass / 3 ignored. Full shader suite: 213 pass / 4 fail / 3 ignored; all four failures are the unchanged pre-existing WARP one-ULP `intersect_tests` cases, not waived or loosened. Texture-layout tests: 10/10 pass. Logs: `work/stability_gpu_tests.txt`, `work/stability_shader_tests.txt`.
+- Rebuilt diagnostics executable and launched `stabilityfix1`, 600 s, verified speed profile only, all excluded switches explicitly removed, no intermediate target dumps. In-game result pending. CPU-only scan of `intro_shadercache_2` also pending (`work/stability_cache2_translate.txt`).
 
 ### DexNom fork re-check (2026-11-25, `538568d`)
 

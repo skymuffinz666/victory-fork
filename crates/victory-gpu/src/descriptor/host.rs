@@ -3586,6 +3586,9 @@ mod tests {
         assert_eq!(slots(frame), [], "a draw read the view: out of the queue");
         heap.queue_texture(4, true, false, frame);
         assert_eq!(slots(frame + TABLED_GRACE), [4], "the replacement must stage again");
+        assert_eq!(heap.tabled_stamp(4) & TABLED_READ, 0, "the old view's read mark must be cleared");
+        heap.tabled_in(4, true, frame);
+        assert_eq!(slots(u64::MAX), [], "the next draw must consume the rewritten view even in the same frame");
     }
 
     #[test]
