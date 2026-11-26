@@ -2229,6 +2229,41 @@ mod relay_tests {
     }
 }
 
+/// Whether flights get more room before the line of them is settled:
+/// twice as many lists in the air ([`late_most`]) and eight times as many
+/// changed runs merged under shader writes ([`stale_under_flights`]).
+/// `VICTORY_SETTLE_ROOM=1` turns it on, `=alt` switches every twenty seconds
+/// (each change is said in the log), unset or anything else keeps the caps.
+/// Opt-in: it holds dynamic descriptor slots and upload memory longer, and
+/// must be measured for refused slots and device loss before becoming a default.
+fn settle_room() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_SETTLE_ROOM").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    });
+    if mode != 2 {
+        return mode == 1;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LAST: AtomicBool = AtomicBool::new(false);
+    let on = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 20)
+        % 2
+        == 0;
+    if LAST.swap(on, Ordering::Relaxed) != on {
+        tracing::info!(
+            "flights get more room from now (lists in the air x2, changed runs merged x8): {}",
+            if on { "ON" } else { "off, the caps as set" }
+        );
+    }
+    on
+}
+
 /// The most host lists in the air before the flights are settled
 /// (`VICTORY_LATE_WAIT_LISTS`, 256; `=128` is the value before: with the
 /// relay it stopped the submitting thread twice a frame for 92-103 ms in
@@ -2241,9 +2276,10 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most * 2 } else { most }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -2483,6 +2519,9 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
         let mut runs_left = 512;
+        if settle_room() {
+            runs_left *= 8;
+        }
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
@@ -5690,7 +5729,13 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if parallel_refresh() {
+                            // Checked with the others of the batch, side by
+                            // side, before the next write of ours or flush.
+                            batch.due_textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -5736,6 +5781,8 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`parallel_refresh`]: textures due a check, not checked yet.
+    due_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -5788,11 +5835,54 @@ impl Batch {
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
+        self.check_textures();
         self.flush();
         self.textures.clear();
     }
 
+    /// With [`parallel_refresh`]: checks the textures due on the helper
+    /// threads, all done before this returns. Each check has its own
+    /// texture's lock and buffer; the write-watch asking and the detiling
+    /// are what run side by side. A texture's check thus reads title memory
+    /// a little later in the preparing, never after a write of ours whose
+    /// lists come before it.
+    fn check_textures(&mut self) {
+        if self.due_textures.is_empty() {
+            return;
+        }
+        let due = std::mem::take(&mut self.due_textures);
+        PARALLEL_CHECKS[0].fetch_add(1, Ordering::Relaxed);
+        PARALLEL_CHECKS[1].fetch_add(due.len() as u64, Ordering::Relaxed);
+        if due.len() < 2 {
+            for staging in due {
+                staging.refresh();
+            }
+            return;
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Ordering::Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = due
+            .into_iter()
+            .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+        let wall = started.elapsed().as_micros() as u64;
+        PREPARING[2].fetch_sub(summed.saturating_sub(wall), Ordering::Relaxed);
+        PARALLEL_CHECKS[2].fetch_add(summed, Ordering::Relaxed);
+        PARALLEL_CHECKS[3].fetch_add(wall, Ordering::Relaxed);
+        if PARALLEL_CHECKS[0].load(Ordering::Relaxed).is_multiple_of(1 << 14) {
+            let [b, n, sum, w] = [0, 1, 2, 3].map(|i| PARALLEL_CHECKS[i].load(Ordering::Relaxed));
+            tracing::info!(
+                "texture checks side by side (VICTORY_PARALLEL_REFRESH) so far: {b} batches, {n} textures; the threads' sum {} ms, the time taken {} ms",
+                sum / 1000,
+                w / 1000
+            );
+        }
+    }
+
     fn flush(&mut self) {
+        self.check_textures();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -5832,6 +5922,40 @@ impl Batch {
         }
     }
 }
+
+/// Whether a submission's texture checks run side by side on the helper
+/// threads (`VICTORY_PARALLEL_REFRESH=1`; `=alt` switches every twenty seconds
+/// with a line in the log; off by default). Opt-in: a check moves from its
+/// step to the next write of ours or flush, so it reads title memory later
+/// in the preparing. Pair with `VICTORY_WIDE_REFRESH` for buffer copies,
+/// which was measured here to have no effect on its own.
+fn parallel_refresh() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_PARALLEL_REFRESH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a submission's texture checks run side by side from now (VICTORY_PARALLEL_REFRESH=alt): {}",
+                    if on { "ON" } else { "off, one after the other as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the start, of [`Batch::check_textures`]: batches, textures, the
+/// threads' summed microseconds, the microseconds taken.
+static PARALLEL_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
