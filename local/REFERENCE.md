@@ -824,6 +824,12 @@ The empty directory `D:\GTA6.Xbox.v1.0.2.1\Leonida` remains because a terminal h
 - Cloned shallow into `D:\AIProjects\GTA6PC\NVIDIA-reference`. Its README claims 26-30 fps at 2560x1440 with DLSS and 2x-6x frame generation on an RTX 5070, but its base is `readmet3xt-lab/foxhound` (`02fc18a`), a different engine lineage from ours; its own findings are measured on an RX 7900 XTX. The performance claim is not a portable patch: the wins it lists (descriptor slots, card hashes, AVX2 compares, texture-back) are already present here or were tested earlier.
 - Tested its one directly portable difference, display resolution: `VICTORY_DISPLAY_MODE=2560x1440` booted cleanly with the known pipeline refusals only and measured **134.99 ms / 7.41 fps** versus 4K queue2-on's 142.46/132.56 ms (mean 137.5). No meaningful gain: GPU time stayed 19-20 ms, so the wall is CPU preparing/copy-back, not pixels. No switch default changed from this review.
 
+### Separate-engine test: trustno1-coder / VIctory-NVIDIA with DLSS + 4x FG (2026-11-27)
+
+- Built the fork at `29d8dbf` in `D:\AIProjects\GTA6PC\NVIDIA-reference` (release and diag) and downloaded its NVIDIA Streamline SDK with `scripts/get-nvidia-sdks.ps1` after the user accepted the licence. The `OPTIDLSS5` OptiScaler folder was not used: it carries OptiScaler/DLSS-NR, not the Streamline ABI this fork calls.
+- Ran Series X, 2560x1440, DLSS Quality, `VICTORY_FRAMEGEN_X=4` against the same game dump for 300 s. Release log (latest `victory-nvidia-*.log`): **32.8 fps rendered / 30.5 ms per frame**, 1 DLSS upscale per frame, **132 frames shown from 33 presents** (exactly 4x), Streamline status 0x0, no device removal. Diag build with captures: **28.8 fps / 34.7 ms**, 120 shown from 30 presents; late capture `c_nvidia_fg_diag/frame-11663.png` is the same prison-window scene with no new visual break. Warnings were the known texture-watch and Streamline frame-time resets during streaming.
+- This is a different engine base with in-memory title patches (allowed here only for this separate test; our `VICTORY-5080` tree is untouched), not a port into ours. It far exceeds 10 fps shown, and its rendered rate is ~29-33 fps against our ~7, but it is not a measured improvement to this fork.
+
 ## Correction: masked-patch measurements invalid for acceptance
 
 The initial local port dispatched patches in the post-submission compare,
