@@ -2188,9 +2188,51 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
+type RelayPiece<T> = (std::sync::Arc<T>, usize, usize, u64);
+
+/// Adjacent fetched pieces of one card copy whose source and destination
+/// are contiguous join one `CopyBufferRegion`; every piece still merges on
+/// its own. The card copies the same bytes either way.
+fn fetch_runs<T>(pieces: &[RelayPiece<T>]) -> impl Iterator<Item = (&T, usize, usize, u64)> {
+    pieces
+        .chunk_by(|left, right| {
+            std::sync::Arc::ptr_eq(&left.0, &right.0)
+                && left.2 == right.1
+                && left.3.checked_add((left.2 - left.1) as u64) == Some(right.3)
+        })
+        .map(|run| {
+            let (shadow, start, _, dest) = &run[0];
+            (shadow.as_ref(), *start, run[run.len() - 1].2, *dest)
+        })
+}
+
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{fetch_runs, flagged_pieces, landable};
+
+    #[test]
+    fn joined_readback_preserves_bytes_order_holes_and_distinct_resources() {
+        use std::sync::Arc;
+        let first = Arc::new([1u8, 2, 3, 4, 5, 6, 7, 8]);
+        let second = Arc::new([11u8, 12, 13, 14, 15, 16, 17, 18]);
+        let mut pieces = [
+            (first.clone(), 0, 2, 0), (first.clone(), 2, 4, 2),
+            (second.clone(), 4, 6, 4), (second.clone(), 6, 7, 8),
+            (second.clone(), 0, 2, 9), (first.clone(), 3, 5, 0),
+        ];
+        let mut bytes = [0xff; 11];
+        let mut count = 0;
+        for (source, lo, hi, dest) in fetch_runs(&pieces) {
+            let at = dest as usize;
+            bytes[at..at + hi - lo].copy_from_slice(&source[lo..hi]);
+            count += 1;
+        }
+        assert_eq!(count, 5);
+        assert_eq!(bytes, [4, 5, 3, 4, 15, 16, 0xff, 0xff, 17, 11, 12]);
+        pieces[1].3 = u64::MAX;
+        assert_eq!(fetch_runs(&pieces).count(), 6);
+        assert!(fetch_runs::<u8>(&[]).next().is_none());
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -3807,8 +3849,8 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for (shadow, lo, hi, at) in fetch_runs(&pieces) {
+                    list.CopyBufferRegion(&buffer, at, &shadow.buffer, lo as u64, (hi - lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -6006,7 +6048,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = if title_dst { read(src, dst, len) } else { read_host(src, dst, len) };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6088,7 +6130,15 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     #[cfg(feature = "diagnostics")]
     crate::backreads::touched(src as usize, dst.len(), false);
-    read(src, dst.as_mut_ptr(), dst.len())
+    read_host(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// Only host-owned destinations: a title destination may alias its source
+/// or require write guards to be opened. A source fault retries the whole
+/// range through the kernel, preserving the existing sparse recovery.
+fn read_host(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    // SAFETY: the caller owns a writable host destination of `len` bytes.
+    (unsafe { crate::plaincopy::copy(src, dst, len) }) || read(src, dst, len)
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -6344,6 +6394,9 @@ impl Meter {
         }
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
+        crate::launch::line(frames);
+        let [plain, fault, small, cooling, off] = crate::plaincopy::per_frame(frames);
+        tracing::info!("host reads per frame: {plain:.1} plain, {fault:.1} fault fallback, {small:.1} small, {cooling:.1} cooling, {off:.1} disabled");
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;

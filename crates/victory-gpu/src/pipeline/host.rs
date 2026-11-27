@@ -412,7 +412,49 @@ pub(crate) struct HostPipeline {
     /// listing (empty for compute).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) state: String,
+    pub(crate) launch: Option<Launch>,
 }
+
+/// Kelvaroq 0041: retain a lazy non-amplified pipeline for multi-record
+/// and count-buffer calls. GraphicsState::clone owns its input names.
+pub(crate) struct Launch {
+    pub(crate) roots: [u32; 3],
+    plain: std::sync::OnceLock<Option<ID3D12PipelineState>>,
+    root: ID3D12RootSignature,
+    root_blob: Vec<u8>,
+    ms: Arc<Shader>,
+    ps: Option<Arc<Shader>>,
+    state: String,
+    graphics: GraphicsState,
+    depth_bounds: bool,
+}
+
+impl Launch {
+    pub(crate) fn plain(&self) -> Option<&ID3D12PipelineState> {
+        self.plain.get_or_init(|| {
+            let host = host()?;
+            let code = |s: &Arc<Shader>| s.translated().map_or(D3D12_SHADER_BYTECODE::default(), |t| {
+                D3D12_SHADER_BYTECODE { pShaderBytecode: t.host.dxil.as_ptr().cast(), BytecodeLength: t.host.dxil.len() }
+            });
+            let ms = code(&self.ms);
+            let ps = self.ps.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), code);
+            let name = super::library::name("mesh payload", &self.root_blob, &[&code_bytes(&ms), &code_bytes(&ps)], &self.state);
+            match mesh_pipeline(&host.device, &self.root, D3D12_SHADER_BYTECODE::default(), ms, ps, &self.graphics, self.depth_bounds, &name) {
+                Ok(pso) => Some(pso),
+                Err(e) => {
+                    tracing::warn!(error = %e, "non-amplified mesh fallback pipeline refused");
+                    host.log_messages();
+                    None
+                }
+            }
+        }).as_ref()
+    }
+}
+
+// SAFETY: D3D12 objects are free-threaded and the owned recipe is immutable.
+unsafe impl Send for Launch {}
+// SAFETY: the only mutation is protected by OnceLock.
+unsafe impl Sync for Launch {}
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
@@ -592,7 +634,21 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        let mut launch_roots = (mesh.is_some() && crate::launch::on()).then(|| {
+            let first = params.len() as u32;
+            params.extend(crate::launch::params());
+            [first, first + 1, first + 2]
+        });
+        let made = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+            Err(e) if let Some([first, ..]) = launch_roots => {
+                tracing::warn!(error = %e, "root signature refused launch parameters; retaining the clamp path");
+                params.truncate(first as usize);
+                launch_roots = None;
+                root_signature(&host.device, &params, &samplers, compute.is_some())
+            }
+            made => made,
+        };
+        let (root, root_blob) = match made {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -636,6 +692,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                launch: None,
                 pso,
                 root,
                 stages: bound,
@@ -675,25 +732,37 @@ impl HostPipeline {
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
             // looked up again.
-            let name = super::library::name(
-                "mesh triangles",
-                &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
-            );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let make = |launched: bool| {
+                let amplification = if launched { crate::launch::code() } else { D3D12_SHADER_BYTECODE::default() };
+                let name = super::library::name(
+                    if launched { "mesh launched" } else { "mesh payload" }, &root_blob,
+                    &[&code_bytes(&code(0)), &code_bytes(&code(1)), if launched { crate::launch::bytes() } else { &[] }], &state,
+                );
+                mesh_pipeline(&host.device, &root, amplification, code(0), code(1), g, depth_bounds, &name)
+            };
+            let pso = match make(launch_roots.is_some()) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, state = %state, "host mesh pipeline refused");
                     host.log_messages();
-                    return None;
+                    if launch_roots.take().is_some() {
+                        make(false).ok()?
+                    } else {
+                        return None;
+                    }
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            let launch = launch_roots.map(|roots| Launch {
+                roots, plain: std::sync::OnceLock::new(), root: root.clone(), root_blob: root_blob.clone(),
+                ms: stages[0].0.clone(), ps: stages.get(1).map(|(s, _)| (*s).clone()),
+                state: state.clone(), graphics: g.clone(), depth_bounds,
+            });
+            tracing::info!(?shaders, launched = launch.is_some(), "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                launch,
                 pso,
                 root,
                 stages: bound,
@@ -817,6 +886,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
+            launch: None,
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
@@ -950,6 +1020,7 @@ fn graphics_depth_bounds_pipeline(
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
+    amplification: D3D12_SHADER_BYTECODE,
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
@@ -960,6 +1031,7 @@ fn mesh_pipeline(
     #[repr(C)]
     struct Stream<D> {
         root: Sub<*mut std::ffi::c_void>,
+        amplification: Sub<D3D12_SHADER_BYTECODE>,
         ms: Sub<D3D12_SHADER_BYTECODE>,
         ps: Sub<D3D12_SHADER_BYTECODE>,
         blend: Sub<D3D12_BLEND_DESC>,
@@ -974,6 +1046,7 @@ fn mesh_pipeline(
     let build = |depth: Sub<_>| {
         let mut stream = Stream {
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+            amplification: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, amplification),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
             blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
@@ -993,6 +1066,7 @@ fn mesh_pipeline(
     if depth_bounds {
         let mut stream = Stream {
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+            amplification: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, amplification),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
             blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
@@ -1146,9 +1220,9 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made");
+        mesh_pipeline(&host.device, &root, D3D12_SHADER_BYTECODE::default(), code(&ms), code(&ps), &g, false, &name).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, D3D12_SHADER_BYTECODE::default(), code(&ms), code(&ps), &g, false, &name).expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
@@ -1410,5 +1484,160 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+
+    /// The launch stage of `crate::launch` in front of a mesh shader that
+    /// declares the payload: records read on the card where they were
+    /// written, a count the CPU knows, the bound at 65,535 groups, an empty
+    /// dimension, and the list's budget, which empties the records past it
+    /// as the clamp does. The mesh shader counts its groups.
+    #[test]
+    fn mesh_records_are_launched_by_the_amplification_stage() {
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.mesh_shaders() {
+            eprintln!("no host mesh shader support; skipped");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        const COUNTING: &str = "struct V { float4 p : SV_Position; };
+            struct P { uint unused; };
+            RWByteAddressBuffer groups : register(u0, space0);
+            [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
+            void main(in payload P pl, out vertices V v[3], out indices uint3 t[1]) {
+                // A triangle of no area: nothing is drawn.
+                SetMeshOutputCounts(3, 1);
+                v[0].p = float4(0, 0, 0, 1);
+                v[1].p = float4(0, 0, 0, 1);
+                v[2].p = float4(0, 0, 0, 1);
+                t[0] = uint3(0, 1, 2);
+                uint was;
+                groups.InterlockedAdd(0, 1, was);
+            }";
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), COUNTING, "ms_6_6");
+        let mut params = vec![D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_MESH,
+        }];
+        params.extend(crate::launch::params());
+        let roots = [1, 2, 3];
+        let (root, root_blob) = root_signature(&host.device, &params, &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.depth.DepthEnable = false.into();
+        let none = D3D12_SHADER_BYTECODE::default();
+        let name = super::super::library::name("launch test", &root_blob, &[&ms, crate::launch::bytes()], &g.describe());
+        let pso = mesh_pipeline(&host.device, &root, crate::launch::code(), code(&ms), none, &g, false, &name)
+            .expect("the mesh pipeline with the launch stage");
+        // The same mesh shader without the stage, as `Launch::plain` makes it.
+        let plain_name = super::super::library::name("launch test plain", &root_blob, &[&ms], &g.describe());
+        mesh_pipeline(&host.device, &root, none, code(&ms), none, &g, false, &plain_name)
+            .expect("the mesh pipeline without the launch stage");
+
+        // The groups one list runs: the direct count first if any, then the
+        // records as the title writes them, 16 bytes apart.
+        let run = |direct: Option<u32>, records: &[[u32; 3]]| -> u32 {
+            let (buffer, data) = host.shared_buffer(4096).unwrap();
+            for (i, r) in records.iter().enumerate() {
+                // SAFETY: 4,096 mapped bytes; 20 records of 16 bytes.
+                unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), data.add(16 * i).cast::<u32>(), 3) };
+            }
+            // SAFETY: a live buffer.
+            let base = unsafe { buffer.GetGPUVirtualAddress() };
+            let groups = host.uav_buffer(256).unwrap();
+            let readback = {
+                let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let rd = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 256,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut out: Option<ID3D12Resource> = None;
+                // SAFETY: a valid read-back buffer description.
+                unsafe {
+                    host.device
+                        .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut out)
+                        .unwrap();
+                }
+                out.unwrap()
+            };
+            let list = host.new_list().unwrap();
+            let list2 = windows::core::Interface::cast::<ID3D12GraphicsCommandList2>(&list.list).unwrap();
+            // SAFETY: an open list and live buffers.
+            unsafe {
+                let at = groups.GetGPUVirtualAddress();
+                list.list.ResourceBarrier(&[crate::host::transition(&groups, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                list2.WriteBufferImmediate(1, &D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at, Value: 0 }, None);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &groups,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                list.list.RSSetViewports(&[D3D12_VIEWPORT { Width: 4.0, Height: 4.0, MaxDepth: 1.0, ..Default::default() }]);
+                list.list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: 4, bottom: 4 }]);
+                list.list.SetGraphicsRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetGraphicsRootUnorderedAccessView(0, at);
+            }
+            use crate::launch::{Launch, record};
+            if let Some(x) = direct {
+                assert!(record(&list, roots, Launch::Direct(x)));
+            }
+            for i in 0..records.len() {
+                assert!(record(&list, roots, Launch::Record(base + 16 * i as u64)));
+            }
+            // SAFETY: an open list and live buffers.
+            unsafe {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &groups,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.list.CopyBufferRegion(&readback, 0, &groups, 0, 4);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &groups,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            list.close();
+            host.execute(&[&list]);
+            host.log_messages();
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: `execute` waited for the card; four bytes were copied.
+            unsafe {
+                readback.Map(0, None, Some(&mut ptr)).unwrap();
+                let n = *ptr.cast::<u32>();
+                readback.Unmap(0, None);
+                n
+            }
+        };
+        assert_eq!(run(None, &[[5, 1, 1]]), 5, "one record");
+        assert_eq!(run(Some(3), &[]), 3, "a count the CPU knows");
+        assert_eq!(run(None, &[[70_000, 1, 1], [7, 0, 1]]), 65_535, "bounded; an empty dimension");
+        // The list's budget (2^27, a mesh group charged as 128): of twenty
+        // records of the most groups a dispatch runs, sixteen fit and the
+        // others run empty. (Draws' amplification groups may run in another
+        // order than the list's, so which records of unequal costs fit past
+        // the budget is the card's order; the total stays bounded.)
+        let big = vec![[65_535, 1, 1]; 20];
+        assert_eq!(u64::from(run(None, &big)), 16 * 65_535, "records past the budget");
+        assert_eq!((1u64 << 27) / (65_535 * 128), 16);
     }
 }
