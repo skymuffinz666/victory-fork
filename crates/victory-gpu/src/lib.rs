@@ -30,6 +30,8 @@ pub mod dxgi;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
+mod gpudetile;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
@@ -46,6 +48,8 @@ mod plaincopy;
 mod launch;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

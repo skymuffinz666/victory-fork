@@ -81,6 +81,29 @@ impl Swizzle {
     pub fn xor(self) -> bool {
         self.0 >= 16
     }
+
+    /// The mode's name as addrlib writes it, without `ADDR_SW_`.
+    pub fn name(self) -> &'static str {
+        match self.0 {
+            0 => "LINEAR",
+            1 => "256B_S",
+            2 => "256B_D",
+            5 => "4KB_S",
+            6 => "4KB_D",
+            9 => "64KB_S",
+            10 => "64KB_D",
+            17 => "64KB_S_T",
+            18 => "64KB_D_T",
+            21 => "4KB_S_X",
+            22 => "4KB_D_X",
+            23 => "4KB_R_X",
+            24 => "64KB_Z_X",
+            25 => "64KB_S_X",
+            26 => "64KB_D_X",
+            27 => "64KB_R_X",
+            _ => "?",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -579,6 +602,45 @@ impl Layout {
     /// 3D textures, else 1 (one array slice).
     pub fn subresource_depth(&self, mip: u32) -> u32 {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
+    }
+
+    /// What a shader needs to detile one subresource exactly as [`Layout::detile`]
+    /// does (the GPU detiler): `None` where `detile` would refuse or the
+    /// offsets do not fit 32 bits.
+    pub fn detile_params(&self, mip: u32, slice: u32) -> Option<DetileParams> {
+        let m = self.mips.get(mip as usize)?;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 { return None; }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices || !self.addressable() || self.size > u64::from(u32::MAX >> 1) {
+            return None;
+        }
+        let linear = self.desc.swizzle == Swizzle::LINEAR;
+        Some(DetileParams {
+            linear,
+            element_bytes: self.desc.element_bytes,
+            width: m.width,
+            height: m.height,
+            depth: m.depth,
+            first,
+            slab: if self.thick { self.block[2] } else { 1 },
+            slice_size: self.slice_size as u32,
+            mip_offset: m.offset as u32,
+            pitch: m.pitch,
+            block_w: self.block[0],
+            block_h: self.block[1],
+            block_log2: self.alignment.trailing_zeros(),
+            tail_x: m.tail.map_or(0, |t| t.x),
+            tail_y: m.tail.map_or(0, |t| t.y),
+        })
+    }
+
+    /// The byte offsets in a block, along x, y and z (empty for linear).
+    pub fn pattern_tables(&self) -> [&[u32]; 3] {
+        [&self.pattern[0], &self.pattern[1], &self.pattern[2]]
     }
 
     /// Copies one subresource out of tiled memory (the whole texture,
@@ -1175,5 +1237,46 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+}
+
+/// One subresource's detiling as a shader does it ([`Layout::detile_params`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetileParams {
+    pub linear: bool,
+    pub element_bytes: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub first: u32,
+    pub slab: u32,
+    pub slice_size: u32,
+    pub mip_offset: u32,
+    pub pitch: u32,
+    pub block_w: u32,
+    pub block_h: u32,
+    pub block_log2: u32,
+    pub tail_x: u32,
+    pub tail_y: u32,
+}
+
+impl DetileParams {
+    /// The tiled byte offset of element (`x`, `y`, `z`), by the shader's
+    /// arithmetic, with the tables of [`Layout::pattern_tables`].
+    pub fn address(&self, tables: [&[u32]; 3], x: u32, y: u32, z: u32) -> u64 {
+        let z = self.first + z;
+        let (slice, inner) = (z / self.slab, z % self.slab);
+        let base = u64::from(slice) * u64::from(self.slice_size) + u64::from(self.mip_offset);
+        let n = u64::from(self.element_bytes);
+        if self.linear {
+            return base + (u64::from(y) * u64::from(self.pitch) + u64::from(x)) * n;
+        }
+        let (x, y) = (x + self.tail_x, y + self.tail_y);
+        let row = (u64::from(y / self.block_h) * u64::from(self.pitch / self.block_w)) << self.block_log2;
+        let column = (u64::from(x / self.block_w)) << self.block_log2;
+        base + row
+            + column
+            + u64::from(tables[1][(y % self.block_h) as usize] | tables[2][inner as usize])
+            + u64::from(tables[0][(x % self.block_w) as usize])
     }
 }

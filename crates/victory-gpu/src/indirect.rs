@@ -468,14 +468,25 @@ void main() {
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            Self::on_adapter(false)
+        }
+
+        fn on_adapter(hardware: bool) -> Option<Self> {
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                let adapter: IDXGIAdapter = if hardware {
+                    factory.EnumAdapters1(0).ok()?.cast().ok()?
+                } else {
+                    factory.EnumWarpAdapter().ok()?
+                };
                 let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) == hardware {
                     return None;
+                }
+                if hardware {
+                    eprintln!("masked patch adapter: {}", String::from_utf16_lossy(&desc.Description));
                 }
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
@@ -799,6 +810,54 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// Execute byte masks on device-local memory and observe them through
+    /// a subsequent consumer copy. Prior flight bytes in unmasked lanes
+    /// must survive, including first/last dwords and a partial thread group.
+    #[test]
+    fn hardware_masked_patch_preserves_flight_bytes_for_the_next_consumer() {
+        let mut gpu = WarpHarness::on_adapter(true).expect("hardware adapter required");
+        let patch = compile_cs(&gpu.device, crate::host::MASKED_PATCH).expect("patch pipeline");
+        const SIZE: usize = 65536;
+        let (upload, source, _) = gpu.shared_buffer(SIZE as u64);
+        let (readback, result, _) = gpu.shared_buffer(SIZE as u64);
+        let card = gpu.default_uav(SIZE as u64);
+        let mut expected: Vec<u8> = (0..SIZE).map(|i| (i * 13 + 71) as u8).collect();
+        let mut words = Vec::new();
+        for i in (0..SIZE).step_by(3) {
+            crate::shadow::patch_words(i, &[0x5a], &[(0, 1)], &mut words);
+        }
+        let words = crate::shadow::folded(words);
+        let (_word_buffer, word_data, word_gpu) = gpu.shared_buffer((words.len() * 12) as u64);
+        // SAFETY: mappings cover the full inputs, and the initial copy is
+        // completed before their CPU contents or the command allocator change.
+        unsafe {
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), source, SIZE);
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), word_data, words.len() * 12);
+            gpu.list.CopyBufferRegion(&card, 0, &upload, 0, SIZE as u64);
+        }
+        gpu.submit_and_wait();
+        for i in (0..SIZE).step_by(3) { expected[i] = 0x5a; }
+        // SAFETY: live resources, matching root signature, transitions order
+        // the patch before its consumer, and the fence precedes CPU reads.
+        unsafe {
+            gpu.list.ResourceBarrier(&[super::transition(&card, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            gpu.list.SetComputeRootSignature(&patch.root);
+            gpu.list.SetPipelineState(&patch.pso);
+            let constants = [words.len() as u32, 0, 0, 0, 0, 0];
+            gpu.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            gpu.list.SetComputeRootShaderResourceView(1, word_gpu);
+            gpu.list.SetComputeRootUnorderedAccessView(2, card.GetGPUVirtualAddress());
+            gpu.list.SetComputeRootUnorderedAccessView(3, readback.GetGPUVirtualAddress());
+            gpu.list.Dispatch((words.len() as u32).div_ceil(64), 1, 1);
+            gpu.list.ResourceBarrier(&[super::transition(&card, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)]);
+            gpu.list.CopyBufferRegion(&readback, 0, &card, 0, SIZE as u64);
+        }
+        gpu.submit_and_wait();
+        let got = unsafe { std::slice::from_raw_parts(result, SIZE) };
+        assert!(got == expected, "consumer must see patched bytes and preserved flight bytes");
+        unsafe { gpu.device.GetDeviceRemovedReason().expect("device remains healthy"); }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

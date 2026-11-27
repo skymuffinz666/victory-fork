@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -99,6 +99,11 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// With [`masked_patch_now`]: the title's changed bytes under flights'
+    /// shader writes that go to the card's side as a masked patch (one
+    /// dword at a time, only the changed bytes stored) rather than as
+    /// copies of their runs. Locked inside `dirty`'s lock, `sent` inside it.
+    patch: Mutex<Patch>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
     /// The copy itself, for [`CHANGED`]: set once it is shared.
@@ -489,6 +494,212 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         }
         true
     });
+    out
+}
+
+/// One dword of a masked patch ([`masked_patch_now`]): its byte offset in
+/// the copy (a multiple of 4), the bytes it sets (a mask of whole bytes),
+/// and their values (other bits 0).
+pub(crate) type PatchWord = [u32; 3];
+
+/// A copy's masked patch not yet sent: its words in the order they were
+/// made, and the byte runs they set.
+#[derive(Default)]
+struct Patch {
+    words: Vec<PatchWord>,
+    ranges: Vec<(usize, usize)>,
+}
+
+/// `VICTORY_MASKED_PATCH`: 0 off (the default), 1 on, 2 in turn (`alt`).
+pub(crate) fn masked_patch_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_MASKED_PATCH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Set by `crate::host` once the patch's pipeline is made: without it the
+/// merge gives up and the flights are settled, as without the switch.
+pub(crate) static PATCH_READY: AtomicBool = AtomicBool::new(false);
+
+/// Since the last frame line: pages patched (each a give-up of the merge
+/// and a settle before), dwords, dispatches, and submissions that sent one.
+pub(crate) static PATCHED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// `VICTORY_PATCH_LEAN`: 0 off (the default), 1 on, 2 `alt` (20s phases).
+pub(crate) fn patch_lean_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PATCH_LEAN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// `VICTORY_PATCH_LEAN`: a page with more than this many changed runs goes
+/// up as one patch even below the merge cap (`VICTORY_PATCH_PAGE_RUNS`, 32).
+fn patch_page_runs() -> usize {
+    static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("VICTORY_PATCH_PAGE_RUNS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(32, |n| n.clamp(1, 4096))
+    })
+}
+
+/// Since the last frame line: pages patched below the cap for many runs,
+/// their runs, word buffers made and reused, while lean.
+pub(crate) static PATCH_LEAN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn patch_lean_now() -> bool {
+    match patch_lean_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: AtomicU8 = AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!("the masked patch runs lean from now (VICTORY_PATCH_LEAN=alt): {}", if on { "on" } else { "off" });
+            }
+            on
+        }
+    }
+}
+
+/// Runs as one span per piece they start in, covering exactly the same
+/// pieces (a page is one piece, and the spans join those pieces).
+pub(crate) fn piece_spans(start: usize, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize, usize)> = Vec::new();
+    for &(a, b) in ranges {
+        let piece = (start + a) / PIECE;
+        match out.last_mut() {
+            Some(last) if last.0 == piece => last.2 = last.2.max(b),
+            _ => out.push((piece, a, b)),
+        }
+    }
+    out.into_iter().map(|(_, a, b)| (a, b)).collect()
+}
+
+/// Whether a page of a copy in the card's memory with more changed runs
+/// than the merge cap leaves goes up as a masked patch instead of settling
+/// the flights (`VICTORY_MASKED_PATCH=1`; `alt`: alternate 20 s phases).
+///
+/// The settles "title memory changed under shader writes" were most of the
+/// submitting thread's wait for the card: some pages change in tens of
+/// thousands of runs of a few bytes, each of which used to go up as a copy
+/// of its own. The patch is one dispatch whatever their number: per changed
+/// dword its offset, a mask of the changed bytes and their values; each
+/// thread stores `(old & !mask) | (value & mask)` into the card's side. It
+/// runs after the flights (in the next submission's compare list), so
+/// `old` holds what their shaders wrote, and no other byte is stored:
+/// exact, like the settle, with no cap.
+pub(crate) fn masked_patch_now() -> bool {
+    if !PATCH_READY.load(Ordering::Relaxed) {
+        return false;
+    }
+    match masked_patch_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: AtomicU8 = AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "title bytes under flights' shader writes past the merge's cap, from now (VICTORY_MASKED_PATCH=alt): {}",
+                    if on { "ON, sent as a masked patch" } else { "off, the flights are settled" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The words of a masked patch for the changed bytes `runs` (offset, bytes;
+/// in order, offsets in `title`) of a page at offset `at` of the copy,
+/// appended to `out`, one word per dword touched.
+pub(crate) fn patch_words(at: usize, title: &[u8], runs: &[(usize, usize)], out: &mut Vec<PatchWord>) {
+    for &(r, m) in runs {
+        for k in r..r + m {
+            let offset = at + k;
+            let word = (offset & !3) as u32;
+            let lane = ((offset & 3) * 8) as u32;
+            let (mask, value) = (0xffu32 << lane, u32::from(title[k]) << lane);
+            match out.last_mut() {
+                Some(w) if w[0] == word => {
+                    w[1] |= mask;
+                    w[2] = (w[2] & !mask) | value;
+                }
+                _ => out.push([word, mask, value]),
+            }
+        }
+    }
+}
+
+/// `words` in the order of their offsets, those of one dword folded into
+/// one in the order they were made (a later word's bytes win): the patch's
+/// threads then never store the same dword.
+pub(crate) fn folded(mut words: Vec<PatchWord>) -> Vec<PatchWord> {
+    words.sort_by_key(|w| w[0]);
+    let mut out: Vec<PatchWord> = Vec::with_capacity(words.len());
+    for w in words {
+        match out.last_mut() {
+            Some(last) if last[0] == w[0] => {
+                last[2] = (last[2] & !w[1]) | (w[2] & w[1]);
+                last[1] |= w[1];
+            }
+            _ => out.push(w),
+        }
+    }
+    out
+}
+
+/// What the patch does to a dword (the shader's store, for the tests).
+#[cfg(test)]
+pub(crate) fn patched_word(old: u32, w: PatchWord) -> u32 {
+    (old & !w[1]) | (w[2] & w[1])
+}
+
+/// The masked patches of the copies in the card's memory, taken for the
+/// send numbered `sent_as`: per copy its words, folded, and the byte runs
+/// they set. With [`relay`] the runs are noted as sent, as the changed
+/// ranges are.
+pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Vec<(usize, usize)>)> {
+    let mut out = Vec::new();
+    if masked_patch_mode() == 0 {
+        return out;
+    }
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    for weak in carded.iter() {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        let Some(c) = shadow.card.as_ref() else {
+            continue;
+        };
+        let taken = {
+            let _dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let mut patch = c.patch.lock().unwrap_or_else(|e| e.into_inner());
+            if patch.words.is_empty() {
+                continue;
+            }
+            let taken = std::mem::take(&mut *patch);
+            if relay() {
+                let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.retain(|s| s.2 > fetched);
+                sent.extend(taken.ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+            }
+            taken
+        };
+        let runs = joined(taken.ranges);
+        let runs = if patch_lean_now() { piece_spans(shadow.start as usize, &runs) } else { runs };
+        out.push((shadow.clone(), folded(taken.words), runs));
+    }
     out
 }
 
@@ -1663,6 +1874,90 @@ pub(crate) fn back_line(frames: f64) {
 }
 
 #[cfg(test)]
+#[cfg(test)]
+mod masked_patch_tests {
+    use super::{PatchWord, folded, patch_words, patched_word};
+
+    /// The patch stores the title's changed bytes and nothing else: every
+    /// byte a "flight" wrote on the card between them stays, however many
+    /// runs there are and wherever they fall in their dwords.
+    #[test]
+    fn the_patch_stores_only_the_changed_bytes() {
+        let n = 4096usize;
+        let at = 3 * 65536 + 4;
+        let old: Vec<u8> = (0..n).map(|i| (i * 7 + 1) as u8).collect();
+        let mut title = old.clone();
+        for i in (0..n).step_by(3) {
+            title[i] ^= 0x5a;
+        }
+        for b in &mut title[1000..1100] {
+            *b = !*b;
+        }
+        let runs = super::changed_runs(&title, &old);
+        assert!(runs.len() > 1000);
+        let mut card = old.clone();
+        let mut flight = vec![false; n];
+        for i in (1..n).step_by(5) {
+            if title[i] == old[i] {
+                card[i] = 0xee;
+                flight[i] = true;
+            }
+        }
+        let mut words: Vec<PatchWord> = Vec::new();
+        patch_words(at, &title, &runs, &mut words);
+        let words = folded(words);
+        for w in &words {
+            assert_eq!(w[0] % 4, 0);
+            let k = w[0] as usize - at;
+            let mut dword = [0u8; 4];
+            dword.copy_from_slice(&card[k..k + 4]);
+            let new = patched_word(u32::from_le_bytes(dword), *w).to_le_bytes();
+            card[k..k + 4].copy_from_slice(&new);
+        }
+        for i in 0..n {
+            let want = if flight[i] { 0xee } else { title[i] };
+            assert_eq!(card[i], want, "byte {i}");
+        }
+    }
+
+    /// Words of one dword made at different times fold into one, the later
+    /// bytes winning, in offset order.
+    #[test]
+    fn words_of_one_dword_fold_in_order() {
+        let words = vec![[8, 0x0000_00ff, 0x11], [0, 0xff00_0000, 0x2200_0000], [8, 0x0000_ffff, 0x3344]];
+        assert_eq!(folded(words), vec![[0, 0xff00_0000, 0x2200_0000], [8, 0x0000_ffff, 0x3344]]);
+        let mut out = Vec::new();
+        patch_words(0, &[1, 2, 3, 4, 5, 6], &[(1, 2), (5, 1)], &mut out);
+        assert_eq!(out, vec![[0, 0x00ff_ff00, 0x0003_0200], [4, 0x0000_ff00, 0x0000_0600]]);
+    }
+
+    /// Lean's spans cover exactly the pieces of the patch's runs, and a
+    /// crowded piece becomes one span rather than thousands.
+    #[test]
+    fn piece_spans_hold_the_pieces_of_the_runs() {
+        use super::{PIECE, piece_spans};
+        let pieces = |start: usize, ranges: &[(usize, usize)]| {
+            let mut all: Vec<usize> = ranges
+                .iter()
+                .flat_map(|&(a, b)| ((start + a) / PIECE)..((start + b - 1) / PIECE + 1))
+                .collect();
+            all.sort_unstable();
+            all.dedup();
+            all
+        };
+        for start in [0usize, 4, PIECE - 4, 0x1234_5678] {
+            let ranges = [(1usize, 5), (PIECE - 3, PIECE + 2), (2 * PIECE, 2 * PIECE + 100), (2 * PIECE + 50, 3 * PIECE + 10)];
+            let spans = piece_spans(start, &ranges);
+            assert_eq!(pieces(start, &spans), pieces(start, &ranges), "start {start:#x}");
+            assert!(spans.len() <= ranges.len());
+        }
+        let crowd: Vec<(usize, usize)> = (0..4000).map(|i| (5 * PIECE + 16 * i, 5 * PIECE + 16 * i + 3)).collect();
+        assert_eq!(piece_spans(0, &crowd), vec![(5 * PIECE, 5 * PIECE + 16 * 3999 + 3)]);
+        assert!(piece_spans(0, &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod wide_tests {
     use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
     use std::sync::Arc;
@@ -2537,6 +2832,13 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // With VICTORY_INPLACE_CONSTANTS the declared range still goes
+            // into the flights' account, so a later CPU reader waits for
+            // the card's writes as for a copy's range.
+            if crate::inplace::constants_on() {
+                let len = len.min(self.left(address));
+                list.defer_gpu_write(self, address as usize, len as usize);
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -3084,14 +3386,43 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
-                        return true;
-                    }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        // Past the cap: the page's exact changed bytes as a
+                        // masked patch, no settle.
+                        if masked_patch_now() && at + n <= u32::MAX as usize {
+                            let exact = changed_runs(title, held);
+                            self.card_patched(at, title, &exact);
+                            for &(r, m) in &exact {
+                                held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                MERGED[1].fetch_add(1, Ordering::Relaxed);
+                                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                            }
+                        } else {
+                            return true;
+                        }
+                    } else {
+                        let lean = runs.len() > patch_page_runs()
+                            && masked_patch_now()
+                            && patch_lean_now()
+                            && at + n <= u32::MAX as usize;
+                        if lean {
+                            PATCH_LEAN[0].fetch_add(1, Ordering::Relaxed);
+                            PATCH_LEAN[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            let exact = changed_runs(title, held);
+                            self.card_patched(at, title, &exact);
+                            for &(r, m) in &exact {
+                                held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                MERGED[1].fetch_add(1, Ordering::Relaxed);
+                                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                            }
+                        } else {
+                            *runs_left -= runs.len();
+                            for (r, m) in runs {
+                                held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                self.card_changed(at + r, at + r + m);
+                                MERGED[1].fetch_add(1, Ordering::Relaxed);
+                                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                            }
+                        }
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -3310,6 +3641,11 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Whether this is title memory in place (`crate::inplace`), not a copy.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
@@ -3335,6 +3671,26 @@ impl Shadow {
         {
             CHANGED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
         }
+    }
+
+    /// The page at offset `at` of a copy in the card's memory takes the
+    /// title's bytes `title` at the changed runs `runs` as a masked patch,
+    /// sent before the next submission ([`card_patches`]).
+    fn card_patched(&self, at: usize, title: &[u8], runs: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if runs.is_empty() {
+            return;
+        }
+        let mut words = Vec::new();
+        patch_words(at, title, runs, &mut words);
+        PATCHED[0].fetch_add(1, Ordering::Relaxed);
+        PATCHED[1].fetch_add(words.len() as u64, Ordering::Relaxed);
+        let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let mut patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
+        patch.words.extend(words);
+        patch.ranges.extend(runs.iter().map(|&(r, m)| (at + r, at + r + m)));
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -3528,10 +3884,12 @@ impl Shadow {
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             dirty
                 .iter()
                 .copied()
+                .chain(patch.ranges.iter().copied())
                 .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
@@ -3692,6 +4050,16 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
+    // The constants heap opens a region only while no title buffer in its
+    // pages has a copy (one memory, one form).
+    let fresh = crate::inplace::constants_on()
+        && map.get(&key).is_some_and(|entry| entry.shadow.is_none())
+        && {
+            let (at, to) = crate::inplace::pages_of_range(key.0, map.get(&key).map_or(0, |entry| entry.end - key.0));
+            let copied = |entry: &Entry| entry.shadow.as_ref().is_some_and(|s: &Arc<Shadow>| !s.in_place());
+            !map.range((at, 0)..(to, 0)).any(|(_, entry)| copied(entry))
+                && !map.range(..(at, 0)).rev().take(256).any(|(_, entry)| entry.end > at && copied(entry))
+        };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -3703,6 +4071,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
+        // The constants heap, and what lies inside it, in place whatever
+        // its size (`VICTORY_INPLACE_CONSTANTS`).
+        if let Some(placed) = crate::inplace::place_constants(key.0, len, fresh) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -3724,6 +4098,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    patch: Mutex::default(),
                     size,
                     me: std::sync::OnceLock::new(),
                 };
@@ -3923,6 +4298,20 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
+    // The constants heap's window, in place whatever its size, if no
+    // other shadow in its pages has a copy.
+    let fresh = crate::inplace::constants_on() && {
+        let (at, to) = crate::inplace::pages_of_range(start, len);
+        let copied = |s: &Arc<Shadow>| !s.in_place();
+        !map.range((at, 0)..(to, 0)).any(|(_, s)| copied(s))
+            && !map.range(..(at, 0)).rev().take(256).any(|(k, s)| k.0 + k.1 > at && copied(s))
+    };
+    if let Some(placed) = crate::inplace::place_constants(start, len, fresh) {
+        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
@@ -3943,6 +4332,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                    patch: Mutex::default(),
                 size: len,
                 me: std::sync::OnceLock::new(),
             };

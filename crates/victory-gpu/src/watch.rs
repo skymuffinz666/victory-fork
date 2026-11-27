@@ -26,6 +26,48 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+mod ranges;
+
+fn guard_intervals() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_GUARD_INTERVALS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("clean guard blocks tracked as exact intervals (VICTORY_GUARD_INTERVALS=1)");
+        }
+        on
+    })
+}
+
+struct CleanBlocks {
+    blocks: BTreeSet<usize>,
+    runs: ranges::Runs,
+}
+
+impl CleanBlocks {
+    const fn new() -> Self {
+        Self { blocks: BTreeSet::new(), runs: ranges::Runs::new() }
+    }
+    fn contains(&self, block: &usize) -> bool {
+        if guard_intervals() { self.runs.covers(*block, block + 1) } else { self.blocks.contains(block) }
+    }
+    fn insert(&mut self, block: usize) {
+        self.extend(block..block + 1);
+    }
+    fn extend(&mut self, range: std::ops::Range<usize>) {
+        if guard_intervals() { self.runs.insert(range.start, range.end); } else { self.blocks.extend(range); }
+    }
+    fn remove(&mut self, block: &usize) {
+        if guard_intervals() { self.runs.remove(*block); } else { self.blocks.remove(block); }
+    }
+    fn covers_fast(&self, first: usize, last: usize) -> bool {
+        guard_intervals() && self.runs.covers(first, last)
+    }
+    fn present(&self, first: usize, last: usize) -> Vec<usize> {
+        if guard_intervals() { self.runs.present(first, last) } else { self.blocks.range(first..last).copied().collect() }
+    }
+}
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -441,7 +483,7 @@ struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    clean: CleanBlocks,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
@@ -453,7 +495,7 @@ struct Guards {
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
+    clean: CleanBlocks::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
 });
@@ -506,7 +548,10 @@ pub(crate) fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
+    if g.clean.covers_fast(first, last) {
+        return Some(written);
+    }
+    let clean = g.clean.present(first, last);
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
