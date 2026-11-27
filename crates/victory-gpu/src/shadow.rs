@@ -1224,6 +1224,79 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 mod difference_tests {
     use super::{first_difference, last_difference};
 
+    /// A small resource on WARP, enough for `Shadow::new`; `differing` only
+    /// reads the host mapping.
+    fn warp_buffer() -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        // SAFETY: plain DXGI and D3D12 creation calls on the software adapter.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            let device = device?;
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: super::PIECE as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer = None;
+            device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .ok()?;
+            buffer
+        }
+    }
+
+    /// A big compare cuts slices at piece boundaries. A copy starting inside
+    /// piece 0 used to underflow on its first cut, so the first slice was
+    /// never compared (upstream PR #1407). Every change is found now, and
+    /// no unchanged piece is reported.
+    #[test]
+    fn a_big_compare_finds_changes_in_its_first_slice() {
+        let Some(buffer) = warp_buffer() else {
+            return;
+        };
+        const LEN: usize = 48 << 20;
+        let before = vec![0u8; LEN];
+        let mut copy = before.clone();
+        let changed = [0usize, 100, (64 << 10) - 1, (64 << 10) + 5, 3 << 20, 20 << 20, 40 << 20, LEN - 1];
+        for &at in &changed {
+            copy[at] = 1;
+        }
+        // 32 KiB into a piece: the first cut can fall before the copy.
+        let start = 0x0012_3456_8000u64;
+        let shadow = super::Shadow::new(buffer, copy.as_mut_ptr(), 0, start, LEN as u64);
+        let found = shadow.differing(0, LEN, &before);
+        drop(shadow);
+        for &at in &changed {
+            assert!(found.iter().any(|&(a, n)| (a..a + n).contains(&at)), "the change at {at:#x} was not found: {found:x?}");
+        }
+        for &(a, n) in &found {
+            assert!(changed.iter().any(|&at| (a..a + n).contains(&at)), "an unchanged piece at {a:#x}+{n:#x}");
+            assert!((start as usize + a + n).is_multiple_of(super::PIECE) || a + n == LEN, "{a:#x}+{n:#x}");
+        }
+    }
+
     /// The chunk searches agree with a byte-wise scan across chunk boundaries.
     #[test]
     fn differences_are_found_as_byte_by_byte() {
@@ -2786,7 +2859,11 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // Saturating: near the copy's start, the piece `at` lies in may
+            // begin before the copy does. Subtracting wrapped (and panicked
+            // with overflow checks), leaving the first slice uncompared in
+            // a release build.
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {
